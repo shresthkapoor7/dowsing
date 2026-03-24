@@ -1,0 +1,51 @@
+[package]
+name = "semantic-navigator"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"  # minimum tested; ort RC requires recent stable
+
+[[bin]]
+name = "semantic-navigator"
+path = "src/main.rs"
+
+[[bin]]
+name = "download-model"
+path = "src/bin/download_model.rs"
+
+[dependencies]
+# Browser control via Chrome DevTools Protocol
+chromiumoxide = { version = "0.7", features = ["tokio-runtime"] }
+
+# ONNX Runtime bindings — runs all-MiniLM-L6-v2 locally
+ort = "2.0.0-rc.12"
+
+# HuggingFace tokenizers — tokenizes text before embedding
+tokenizers = { version = "0.19", default-features = false, features = ["onig"] }
+
+# Array math for mean pooling over token embeddings
+ndarray = "0.17"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Stream extension for chromiumoxide handler loop
+futures = "0.3"
+
+# Error handling
+anyhow = "1"
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# HTTP — used by download-model bin and eval harness
+reqwest = { version = "0.12", features = ["blocking"] }
+
+# Clipboard access — final output is copied to clipboard for pasting into any LLM
+arboard = "3"
+
+# PATH binary lookup — used by browser.rs to find Chromium on Linux
+which = "6"
+
+# Serialization — used by eval harness
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

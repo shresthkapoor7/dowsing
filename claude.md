@@ -6,11 +6,13 @@ Navigate any website to answer a question using embedding similarity. No LLM per
 
 Existing browser agents call an LLM at every navigation decision. Every click costs money and time.
 
-This tool embeds the question once. Every navigation decision is cosine similarity between the query embedding and link context embeddings. The LLM is never involved in navigation. Only called at the end if you want answer synthesis.
+This tool embeds the question once. Every navigation decision is cosine similarity between the query embedding and link context embeddings. The LLM is never involved in navigation.
+
+**Output:** the plain text content of the most relevant page found, copied directly to the clipboard. Paste it into whatever LLM you want. No vendor lock-in, no API key required for retrieval.
 
 ```
 existing:   question → LLM → click → LLM → click → LLM → click → answer
-this tool:  question → embed once → similarity → click → similarity → click → answer
+this tool:  question → embed once → similarity → click → similarity → click → plain text → clipboard
 ```
 
 ## Repository structure

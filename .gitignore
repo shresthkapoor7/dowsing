@@ -1,0 +1,11 @@
+/target
+
+# Model files — large binaries, download with: cargo run --bin download-model
+/models/*.onnx
+/models/*.json
+
+# Eval results output
+results.json
+
+# macOS
+.DS_Store
