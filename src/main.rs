@@ -44,7 +44,8 @@ async fn main() -> Result<()> {
     println!("[browser] using binary: {}", binary.display());
     println!("[browser] profile: temporary (no cookies) — Phase 3 adds your real profile");
     println!("[browser] fetching {}", cli.start);
-    let html = browser::fetch_html(&cli.start).await?;
+    // Pass the resolved binary in so fetch_html doesn't scan /Applications a second time.
+    let html = browser::fetch_html(&cli.start, &binary).await?;
     println!("[browser] fetched {} bytes", html.len());
 
     // --- Primitive 2: embedder ---
@@ -82,15 +83,50 @@ async fn main() -> Result<()> {
 }
 
 /// Collapse HTML into plain text by stripping tags and normalizing whitespace.
+/// Skips the full contents of <script> and <style> blocks so JS and CSS
+/// don't end up in the clipboard output.
 /// Phase 2 replaces this with proper Readability-style extraction.
 fn strip_tags(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut in_tag = false;
+    let mut skip_block: Option<&'static str> = None; // closing tag we're waiting for
+    let mut tag_buf = String::new(); // accumulates the current tag name
+
     for ch in html.chars() {
         match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(ch),
+            '<' => {
+                in_tag = true;
+                tag_buf.clear();
+            }
+            '>' => {
+                in_tag = false;
+                // Decide whether to enter or leave a skip block based on the tag name.
+                // tag_buf may look like "script", "/script", "style src=...", etc.
+                let name: String = tag_buf
+                    .trim_start_matches('/')
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric())
+                    .flat_map(|c| c.to_lowercase())
+                    .collect();
+
+                match skip_block {
+                    None if name == "script" => skip_block = Some("</script>"),
+                    None if name == "style" => skip_block = Some("</style>"),
+                    Some(closing) => {
+                        let closing_name: String = closing
+                            .trim_start_matches('<')
+                            .trim_start_matches('/')
+                            .trim_end_matches('>')
+                            .to_string();
+                        if name == closing_name {
+                            skip_block = None;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ if in_tag => tag_buf.push(ch),
+            _ if skip_block.is_none() => out.push(ch),
             _ => {}
         }
     }

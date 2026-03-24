@@ -51,11 +51,25 @@ impl Embedder {
     /// The returned vector is a unit vector. Dot product between two of these
     /// equals cosine similarity — no magnitude computation needed at query time.
     pub fn embed(&mut self, text: &str) -> Result<Vec<f32>> {
+        anyhow::ensure!(!text.trim().is_empty(), "cannot embed empty text");
+
         // --- Step 1: tokenize ---
+        // all-MiniLM-L6-v2 has a hard limit of 512 tokens. Truncate before encoding
+        // so the ONNX model never receives a sequence it cannot handle.
+        // Phase 2 will chunk long pages and aggregate embeddings properly.
+        const MAX_CHARS: usize = 1800; // ~512 tokens at ~3.5 chars/token average
+        let text = if text.len() > MAX_CHARS {
+            &text[..MAX_CHARS]
+        } else {
+            text
+        };
+
         let encoding = self
             .tokenizer
             .encode(text, true)
             .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
+
+        anyhow::ensure!(!encoding.get_ids().is_empty(), "tokenizer produced empty encoding");
 
         let ids: Vec<i64> = encoding.get_ids().iter().map(|&x| x as i64).collect();
         let mask: Vec<i64> = encoding

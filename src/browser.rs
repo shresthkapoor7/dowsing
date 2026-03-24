@@ -207,11 +207,11 @@ fn find_chromium_binary_linux() -> Result<PathBuf> {
         .with_context(|| format!("default browser '{}' not found on PATH", bin_name))
 }
 
-/// Launch the default Chromium-based browser, navigate to `url`, and return the full page HTML.
-pub async fn fetch_html(url: &str) -> Result<String> {
-    let binary = find_chromium_binary()
-        .context("could not find a Chromium-based browser to launch")?;
-
+/// Launch the Chromium browser at `binary`, navigate to `url`, and return the full page HTML.
+///
+/// The caller is expected to resolve the binary path once via find_chromium_binary()
+/// and pass it in — this avoids scanning /Applications on every call.
+pub async fn fetch_html(url: &str, binary: &std::path::Path) -> Result<String> {
     let config = BrowserConfig::builder()
         .chrome_executable(binary)
         // Suppress first-run dialogs and default-browser prompts that block CDP
