@@ -6,79 +6,208 @@
 //   - CDP (Chrome DevTools Protocol) only works with Chromium-based browsers.
 //     Safari and Firefox are not supported. Arc, Brave, Edge, Chromium, and
 //     Google Chrome all work.
-//   - find_chromium_binary() searches common install locations in priority order.
-//     First match wins. No hardcoded assumption of "Google Chrome".
-//   - headless: false during development so you can watch the browser.
-//     Flip to true for benchmarking (see BrowserConfig::builder().headless(true)).
+//   - find_chromium_binary() asks the OS what the default browser is, then
+//     resolves its executable path. No hardcoded priority list.
+//   - If the default browser is not Chromium-based (e.g. Safari, Firefox) the
+//     error message says so clearly.
+//   - headless(false) during development so you can watch the browser.
+//     Switch to HeadlessMode::True for benchmarking.
 //   - No user profile in Phase 1. The browser opens a fresh temporary profile.
-//     Phase 3 adds user_data_dir() so the navigator inherits existing cookies
-//     and authenticated sessions without needing credentials.
-//   - The browser handler must be spawned on a separate task. chromiumoxide
-//     processes CDP events in the background; if the handler is not polled the
-//     browser will hang. See the spawn call in fetch_html.
+//     Phase 3 adds user_data_dir() so the navigator inherits existing sessions.
 //
-// User profile paths (for Phase 3, pick the one matching the browser found here):
+// User profile paths (for Phase 3):
 //   Arc:    ~/Library/Application Support/Arc/User Data/Default
 //   Chrome: ~/Library/Application Support/Google/Chrome/Default
 //   Brave:  ~/Library/Application Support/BraveSoftware/Brave-Browser/Default
 //   Edge:   ~/Library/Application Support/Microsoft Edge/Default
 
 use anyhow::{Context, Result};
-use chromiumoxide::{Browser, BrowserConfig, browser::HeadlessMode};
+use chromiumoxide::browser::HeadlessMode;
+use chromiumoxide::{Browser, BrowserConfig};
 use futures::StreamExt;
 use std::path::PathBuf;
+use std::process::Command;
 
-/// Locations to search for a Chromium-based binary, in priority order.
-/// Arc is listed first since it is the most common default on macOS these days.
+// Bundle IDs of known Chromium-based browsers on macOS.
+// Used to validate that the default browser supports CDP before launching.
 #[cfg(target_os = "macos")]
-const CHROMIUM_CANDIDATES: &[&str] = &[
-    "/Applications/Arc.app/Contents/MacOS/Arc",
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+const CHROMIUM_BUNDLE_PREFIXES: &[&str] = &[
+    "com.google.chrome",
+    "com.brave.browser",
+    "company.thebrowser.browser", // Arc
+    "com.microsoft.edgemac",
+    "org.chromium.chromium",
+    "com.operasoftware.opera",
+    "com.vivaldi.vivaldi",
 ];
 
-#[cfg(target_os = "linux")]
-const CHROMIUM_CANDIDATES: &[&str] = &[
-    "google-chrome",
-    "chromium",
-    "chromium-browser",
-    "brave-browser",
-    "microsoft-edge",
-];
-
-#[cfg(target_os = "windows")]
-const CHROMIUM_CANDIDATES: &[&str] = &[
-    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-];
-
-/// Return the path to the first Chromium-compatible binary found on this system.
+/// Return the path to the default browser's executable.
+///
+/// Asks the OS directly — macOS via LaunchServices plist + mdfind,
+/// Linux via xdg-settings. Fails with a clear message if the default
+/// browser is not Chromium-based (Safari, Firefox, etc.).
 pub fn find_chromium_binary() -> Result<PathBuf> {
-    for candidate in CHROMIUM_CANDIDATES {
-        let path = PathBuf::from(candidate);
-        // Absolute path: check it exists. Bare name: trust PATH lookup.
-        if path.is_absolute() {
-            if path.exists() {
-                return Ok(path);
-            }
-        } else if which::which(candidate).is_ok() {
-            return Ok(PathBuf::from(candidate));
-        }
-    }
-    anyhow::bail!(
-        "no Chromium-based browser found. Install Arc, Chrome, Brave, or Edge.\n\
-         Searched: {}",
-        CHROMIUM_CANDIDATES.join(", ")
-    )
+    #[cfg(target_os = "macos")]
+    return find_chromium_binary_macos();
+
+    #[cfg(target_os = "linux")]
+    return find_chromium_binary_linux();
+
+    #[cfg(target_os = "windows")]
+    anyhow::bail!("Windows browser detection not yet implemented");
 }
 
-/// Launch a Chromium-based browser, navigate to `url`, and return the full page HTML.
+/// macOS: read the LaunchServices plist for the default https handler,
+/// verify it is Chromium-based, then resolve its executable path.
+#[cfg(target_os = "macos")]
+fn find_chromium_binary_macos() -> Result<PathBuf> {
+    let bundle_id = default_browser_bundle_id_macos()
+        .context("could not read default browser from LaunchServices")?;
+
+    // Verify it's a browser that supports CDP before trying to launch it.
+    let bundle_id_lower = bundle_id.to_lowercase();
+    let is_chromium = CHROMIUM_BUNDLE_PREFIXES
+        .iter()
+        .any(|prefix| bundle_id_lower.starts_with(prefix));
+
+    if !is_chromium {
+        anyhow::bail!(
+            "your default browser (bundle ID: {}) does not support CDP.\n\
+             This tool requires a Chromium-based browser: Arc, Chrome, Brave, or Edge.\n\
+             Change your default browser in System Settings → Desktop & Dock → Default web browser.",
+            bundle_id
+        );
+    }
+
+    executable_for_bundle_macos(&bundle_id)
+        .with_context(|| format!("found bundle {} but could not locate its executable", bundle_id))
+}
+
+/// Read ~/Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist
+/// and extract the bundle ID registered as the default https:// handler.
 ///
-/// Opens a non-headless window so you can watch what happens during development.
-/// Each call launches a fresh browser instance and closes it when done.
+/// Uses `plutil -convert json` to get reliable JSON rather than parsing the
+/// human-readable plist text format, which has nested dicts that trip up
+/// simple line-by-line parsers.
+#[cfg(target_os = "macos")]
+fn default_browser_bundle_id_macos() -> Result<String> {
+    let home = std::env::var("HOME").context("HOME not set")?;
+    let plist = format!(
+        "{}/Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist",
+        home
+    );
+
+    // plutil converts the binary/XML plist to JSON and writes it to stdout (-o -)
+    let output = Command::new("plutil")
+        .args(["-convert", "json", "-o", "-", &plist])
+        .output()
+        .context("failed to run plutil — is macOS developer tools installed?")?;
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("plutil output was not valid JSON")?;
+
+    // LSHandlers is an array of dicts; each dict has LSHandlerURLScheme and LSHandlerRoleAll.
+    // Some dicts also have a nested LSHandlerPreferredVersions dict that contains its own
+    // LSHandlerRoleAll = "-" — we want the top-level one, which serde_json gives us directly.
+    let handlers = json["LSHandlers"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("LSHandlers key not found in plist"))?;
+
+    for handler in handlers {
+        if handler["LSHandlerURLScheme"].as_str() == Some("https") {
+            if let Some(bundle_id) = handler["LSHandlerRoleAll"].as_str() {
+                return Ok(bundle_id.to_string());
+            }
+        }
+    }
+
+    anyhow::bail!("https handler not found in LaunchServices plist")
+}
+
+/// Scan /Applications for a .app whose CFBundleIdentifier matches `bundle_id`
+/// case-insensitively, then return the path to its executable binary.
+///
+/// We avoid mdfind here because LaunchServices and Spotlight index bundle IDs
+/// with inconsistent casing (e.g. LaunchServices stores "com.brave.browser"
+/// but the app's Info.plist and Spotlight index have "com.brave.Browser").
+#[cfg(target_os = "macos")]
+fn executable_for_bundle_macos(bundle_id: &str) -> Result<PathBuf> {
+    let bundle_id_lower = bundle_id.to_lowercase();
+
+    let apps_dir = std::fs::read_dir("/Applications")
+        .context("could not read /Applications")?;
+
+    for entry in apps_dir.flatten() {
+        let app_path = entry.path();
+        if app_path.extension().and_then(|e| e.to_str()) != Some("app") {
+            continue;
+        }
+
+        let info_plist = app_path.join("Contents/Info.plist");
+        if !info_plist.exists() {
+            continue;
+        }
+
+        // Read CFBundleIdentifier from the app's Info.plist
+        let id_output = Command::new("defaults")
+            .arg("read")
+            .arg(app_path.join("Contents/Info").to_str().unwrap_or(""))
+            .arg("CFBundleIdentifier")
+            .output();
+
+        let Ok(id_output) = id_output else { continue };
+        let app_bundle_id = String::from_utf8_lossy(&id_output.stdout)
+            .trim()
+            .to_lowercase();
+
+        if app_bundle_id != bundle_id_lower {
+            continue;
+        }
+
+        // Found the app — now get the binary name
+        let exe_output = Command::new("defaults")
+            .arg("read")
+            .arg(app_path.join("Contents/Info").to_str().unwrap_or(""))
+            .arg("CFBundleExecutable")
+            .output()
+            .context("failed to read CFBundleExecutable")?;
+
+        let exe_name = String::from_utf8_lossy(&exe_output.stdout)
+            .trim()
+            .to_string();
+
+        let exe_path = app_path.join("Contents/MacOS").join(&exe_name);
+        if exe_path.exists() {
+            return Ok(exe_path);
+        }
+    }
+
+    anyhow::bail!("no .app found for bundle ID {}", bundle_id)
+}
+
+/// Linux: ask xdg-settings for the default browser desktop entry,
+/// then resolve the executable via the PATH.
+#[cfg(target_os = "linux")]
+fn find_chromium_binary_linux() -> Result<PathBuf> {
+    let output = Command::new("xdg-settings")
+        .arg("get")
+        .arg("default-web-browser")
+        .output()
+        .context("failed to run xdg-settings — is xdg-utils installed?")?;
+
+    let desktop_entry = String::from_utf8(output.stdout)
+        .context("non-UTF8 xdg-settings output")?
+        .trim()
+        .to_string();
+
+    // Desktop entry filename → likely binary name: e.g. "brave-browser.desktop" → "brave-browser"
+    let bin_name = desktop_entry.trim_end_matches(".desktop");
+
+    which::which(bin_name)
+        .with_context(|| format!("default browser '{}' not found on PATH", bin_name))
+}
+
+/// Launch the default Chromium-based browser, navigate to `url`, and return the full page HTML.
 pub async fn fetch_html(url: &str) -> Result<String> {
     let binary = find_chromium_binary()
         .context("could not find a Chromium-based browser to launch")?;
@@ -89,7 +218,7 @@ pub async fn fetch_html(url: &str) -> Result<String> {
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
         .arg("--disable-default-apps")
-        // Visible window for development. Switch to .headless(true) for benchmarking.
+        // Visible window for development. Switch to HeadlessMode::True for benchmarking.
         .headless_mode(HeadlessMode::False)
         .build()
         .map_err(|e| anyhow::anyhow!("BrowserConfig error: {}", e))?;
@@ -107,10 +236,7 @@ pub async fn fetch_html(url: &str) -> Result<String> {
     });
 
     let page = browser.new_page(url).await?;
-
-    // Wait for the page to settle before reading content.
     page.wait_for_navigation().await?;
-
     let html = page.content().await?;
 
     Ok(html)
