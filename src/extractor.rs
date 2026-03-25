@@ -18,6 +18,7 @@
 use anyhow::Result;
 use scraper::{ElementRef, Html, Selector};
 
+#[derive(Debug, Clone)]
 pub struct LinkContext {
     /// The formatted string that gets embedded for similarity scoring.
     pub context_string: String,

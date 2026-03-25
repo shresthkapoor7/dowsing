@@ -35,6 +35,10 @@ struct Cli {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Validate start URL early so we get a clear error instead of silent link-drop failures
+    url::Url::parse(&cli.start)
+        .map_err(|e| anyhow::anyhow!("invalid --start URL '{}': {}", cli.start, e))?;
+
     // --- Browser: fetch raw HTML ---
     let binary = browser::find_chromium_binary()?;
     println!("[browser] using binary: {}", binary.display());
@@ -46,13 +50,15 @@ async fn main() -> Result<()> {
     println!("[embedder] loading model from models/");
     let mut embedder = embedder::Embedder::new("models/model.onnx", "models/tokenizer.json")?;
     let query_embedding = embedder.embed(&cli.query)?;
+    let preview: Vec<String> = query_embedding
+        .iter()
+        .take(4)
+        .map(|v| format!("{:.4}", v))
+        .collect();
     println!(
-        "[embedder] query embedded ({} dims): [{:.4}, {:.4}, {:.4}, {:.4}, ...]",
+        "[embedder] query embedded ({} dims): [{}...]",
         query_embedding.len(),
-        query_embedding[0],
-        query_embedding[1],
-        query_embedding[2],
-        query_embedding[3],
+        preview.join(", "),
     );
 
     // --- Extractor: clean prose from the page ---
