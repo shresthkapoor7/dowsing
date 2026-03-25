@@ -1,20 +1,19 @@
 // main.rs — CLI entry point
 //
-// Phase 1: exercises the two core primitives independently.
-//   1. browser::fetch_html   — launches a Chromium browser, loads a URL, returns raw HTML
-//   2. embedder::Embedder    — loads ONNX model, embeds a string, returns Vec<f32>
+// Phase 2: end-to-end integration.
+//   - Fetches page HTML via chromiumoxide (browser.rs)
+//   - Extracts clean prose text with Readability-style heuristics (extractor.rs)
+//   - Extracts links with rich context strings (extractor.rs)
+//   - Embeds query + page content + every link context (embedder.rs)
+//   - Prints page score and top-10 scored links to stdout
+//   - Copies page content to clipboard
 //
-// Output: plain text of the best page found, copied to clipboard.
-//         Paste into any LLM of your choice.
-//
-// Run (Phase 1):
-//   cargo run --bin semantic-navigator -- --query "your question" --start "https://example.com"
-//
-// Phase 1 limitation: copies raw HTML with tags stripped via whitespace collapse.
-// Phase 2 replaces this with proper Readability-style extraction (clean prose only).
+// Done when: `cargo run -- --query "..." --start "https://..."` prints a page
+// score and a ranked list of links.
 
 mod browser;
 mod embedder;
+mod extractor;
 
 use anyhow::Result;
 use arboard::Clipboard;
@@ -36,100 +35,79 @@ struct Cli {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // --- Primitive 1: browser ---
-    // Print which binary was found so you can confirm it's the browser you expect.
-    // Profile: Phase 1 uses a FRESH temporary profile (no cookies, no sessions).
-    //          Phase 3 will add user_data_dir() to inherit your existing sessions.
+    // Validate start URL early so we get a clear error instead of silent link-drop failures
+    url::Url::parse(&cli.start)
+        .map_err(|e| anyhow::anyhow!("invalid --start URL '{}': {}", cli.start, e))?;
+
+    // --- Browser: fetch raw HTML ---
     let binary = browser::find_chromium_binary()?;
     println!("[browser] using binary: {}", binary.display());
-    println!("[browser] profile: temporary (no cookies) — Phase 3 adds your real profile");
     println!("[browser] fetching {}", cli.start);
-    // Pass the resolved binary in so fetch_html doesn't scan /Applications a second time.
     let html = browser::fetch_html(&cli.start, &binary).await?;
-    println!("[browser] fetched {} bytes", html.len());
+    println!("[browser] fetched {} bytes of HTML", html.len());
 
-    // --- Primitive 2: embedder ---
+    // --- Embedder: load model, embed query once ---
     println!("[embedder] loading model from models/");
     let mut embedder = embedder::Embedder::new("models/model.onnx", "models/tokenizer.json")?;
-
     let query_embedding = embedder.embed(&cli.query)?;
+    let preview: Vec<String> = query_embedding
+        .iter()
+        .take(4)
+        .map(|v| format!("{:.4}", v))
+        .collect();
     println!(
-        "[embedder] embedded query ({} dims): {:?}",
+        "[embedder] query embedded ({} dims): [{}...]",
         query_embedding.len(),
-        &query_embedding[..4]   // print first 4 dims to keep output readable
+        preview.join(", "),
     );
 
-    // Strip HTML tags with a simple whitespace collapse — good enough for Phase 1.
-    // Phase 2 replaces this with proper Readability extraction (clean prose, no nav/footer).
-    let plain_text = strip_tags(&html);
+    // --- Extractor: clean prose from the page ---
+    let page_content = extractor::extract_page_content(&html);
+    println!(
+        "[extractor] extracted {} chars of clean content",
+        page_content.len()
+    );
 
-    // Score the full plain text against the query so the number is meaningful.
-    let page_embedding = embedder.embed(&plain_text)?;
-    let score: f32 = query_embedding
+    // --- Score: how relevant is this page to the query? ---
+    let page_embedding = embedder.embed(&page_content)?;
+    let page_score: f32 = dot(&query_embedding, &page_embedding);
+    println!("[score] page relevance: {:.4}", page_score);
+
+    // --- Links: extract + score every link on the page ---
+    let links = extractor::extract_links(&html, &cli.start);
+    println!("[extractor] found {} links", links.len());
+
+    let mut scored: Vec<(f32, &str, &str)> = links
         .iter()
-        .zip(page_embedding.iter())
-        .map(|(a, b)| a * b)
-        .sum();
+        .filter_map(|link| {
+            // Embed the context string; skip on error (malformed text etc.)
+            embedder
+                .embed(&link.context_string)
+                .ok()
+                .map(|emb| (dot(&query_embedding, &emb), link.url.as_str(), link.context_string.as_str()))
+        })
+        .collect();
 
-    println!("[score] page vs query: {:.4}", score);
-    println!("[output] {} chars of plain text", plain_text.len());
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Copy to clipboard — paste into any LLM you want.
+    println!("\n--- Top 10 links by relevance ---");
+    for (score, url, ctx) in scored.iter().take(10) {
+        // Print a truncated context string so it fits on one line
+        let preview: String = ctx.chars().take(100).collect();
+        println!("  {:.4}  {}  [{}...]", score, url, preview);
+    }
+    println!();
+
+    // --- Clipboard: copy page content for pasting into any LLM ---
     let mut clipboard = Clipboard::new()?;
-    clipboard.set_text(plain_text)?;
-    println!("[clipboard] copied — paste into your LLM");
+    clipboard.set_text(page_content)?;
+    println!("[clipboard] page content copied — paste into your LLM");
 
     Ok(())
 }
 
-/// Collapse HTML into plain text by stripping tags and normalizing whitespace.
-/// Skips the full contents of <script> and <style> blocks so JS and CSS
-/// don't end up in the clipboard output.
-/// Phase 2 replaces this with proper Readability-style extraction.
-fn strip_tags(html: &str) -> String {
-    let mut out = String::with_capacity(html.len());
-    let mut in_tag = false;
-    let mut skip_block: Option<&'static str> = None; // closing tag we're waiting for
-    let mut tag_buf = String::new(); // accumulates the current tag name
-
-    for ch in html.chars() {
-        match ch {
-            '<' => {
-                in_tag = true;
-                tag_buf.clear();
-            }
-            '>' => {
-                in_tag = false;
-                // Decide whether to enter or leave a skip block based on the tag name.
-                // tag_buf may look like "script", "/script", "style src=...", etc.
-                let name: String = tag_buf
-                    .trim_start_matches('/')
-                    .chars()
-                    .take_while(|c| c.is_alphanumeric())
-                    .flat_map(|c| c.to_lowercase())
-                    .collect();
-
-                match skip_block {
-                    None if name == "script" => skip_block = Some("</script>"),
-                    None if name == "style" => skip_block = Some("</style>"),
-                    Some(closing) => {
-                        let closing_name: String = closing
-                            .trim_start_matches('<')
-                            .trim_start_matches('/')
-                            .trim_end_matches('>')
-                            .to_string();
-                        if name == closing_name {
-                            skip_block = None;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            _ if in_tag => tag_buf.push(ch),
-            _ if skip_block.is_none() => out.push(ch),
-            _ => {}
-        }
-    }
-    // Collapse runs of whitespace into single spaces
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+/// Dot product of two equal-length vectors.
+/// Because embeddings are L2-normalized this equals cosine similarity.
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
