@@ -34,7 +34,6 @@ async fn main() -> Result<()> {
     // --- Embedder ---
     println!("[embedder] loading model...");
     let mut embedder = embedder::Embedder::new("models/model.onnx", "models/tokenizer.json")?;
-
     let query_embedding = embedder.embed(&cli.query)?;
     println!("[embedder] query embedded ({} dims)", query_embedding.len());
 
@@ -58,11 +57,6 @@ async fn main() -> Result<()> {
     browser::close_our_pages(&session.browser, &opened_pages).await;
 
     // --- Disconnect from browser without closing it ---
-    // This drops the Browser (closing the handler channel), then waits for
-    // the handler task to shut down cleanly so the websocket gets a proper
-    // close handshake. Without this, the abrupt TCP reset on process exit
-    // causes Chrome/Brave to interpret the disconnect as "controller died"
-    // and shut down the entire browser.
     session.disconnect().await;
 
     // --- Results ---

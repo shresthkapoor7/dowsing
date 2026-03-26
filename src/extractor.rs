@@ -1,6 +1,15 @@
 // extractor.rs — DOM content extraction and link context building
 //
-// Extracts readable page text and contextualized links from HTML.
+// Phase 2 responsibility:
+//   1. extract_page_content(html) → clean prose text (Readability-style)
+//   2. extract_links(html, base_url) → Vec<LinkContext> with rich context strings
+//
+// Content extraction:
+//   Prefers <article> or <main> as the content root, falls back to <body>.
+//   Skips <script>, <style>, <nav>, <header>, <footer>, <aside> subtrees.
+//
+// Link context format:
+//   "heading: {nearest h1-h6} | text: {anchor text} | context: {parent block text} | url: {absolute url}"
 
 use anyhow::Result;
 use scraper::{ElementRef, Html, Selector};
@@ -12,6 +21,10 @@ pub struct LinkContext {
     /// The absolute URL this link points to.
     pub url: String,
 }
+
+// ---------------------------------------------------------------------------
+// Content extraction
+// ---------------------------------------------------------------------------
 
 /// Extract the main readable content from an HTML page as plain text.
 pub fn extract_page_content(html: &str) -> String {
@@ -62,6 +75,10 @@ fn collect_text(node: ElementRef, out: &mut String) {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Link extraction
+// ---------------------------------------------------------------------------
 
 /// Extract all links from a page with rich context strings for embedding.
 pub fn extract_links(html: &str, base_url: &str) -> Vec<LinkContext> {
