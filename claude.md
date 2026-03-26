@@ -92,7 +92,7 @@ Embed the query once at startup. Cache it. Never re-embed the query.
 
 Simple in-memory structure. For the scale of links on a documentation site (hundreds to low thousands per session) there is no need for HNSW or any approximate nearest neighbor structure. Flat linear scan is fast enough and exact.
 
-Each entry: `(text: String, embedding: Vec<f32>)`
+Each  entry: `(text: String, embedding: Vec<f32>)`
 
 At search time: compute dot product between query embedding and every entry embedding, return top-k by score.
 
