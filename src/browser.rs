@@ -1,35 +1,25 @@
 // browser.rs — Chrome control via chromiumoxide (Chrome DevTools Protocol)
 //
-// Phase 1 responsibility: launch a Chromium-based browser, load a URL, return raw HTML.
+// Uses the user's RUNNING browser — no new windows, no profile copying.
+// Opens tabs in the existing session (authenticated pages just work),
+// closes only the tabs it opened when done.
 //
-// Key decisions:
-//   - CDP (Chrome DevTools Protocol) only works with Chromium-based browsers.
-//     Safari and Firefox are not supported. Arc, Brave, Edge, Chromium, and
-//     Google Chrome all work.
-//   - find_chromium_binary() asks the OS what the default browser is, then
-//     resolves its executable path. No hardcoded priority list.
-//   - If the default browser is not Chromium-based (e.g. Safari, Firefox) the
-//     error message says so clearly.
-//   - headless(false) during development so you can watch the browser.
-//     Switch to HeadlessMode::True for benchmarking.
-//   - No user profile in Phase 1. The browser opens a fresh temporary profile.
-//     Phase 3 adds user_data_dir() so the navigator inherits existing sessions.
-//
-// User profile paths (for Phase 3):
-//   Arc:    ~/Library/Application Support/Arc/User Data/Default
-//   Chrome: ~/Library/Application Support/Google/Chrome/Default
-//   Brave:  ~/Library/Application Support/BraveSoftware/Brave-Browser/Default
-//   Edge:   ~/Library/Application Support/Microsoft Edge/Default
+// If the browser isn't running with remote debugging, restarts it with
+// --remote-debugging-port=9222. Brave/Chrome restore all tabs on restart.
 
 use anyhow::{Context, Result};
-use chromiumoxide::browser::HeadlessMode;
-use chromiumoxide::{Browser, BrowserConfig};
+use chromiumoxide::Browser;
 use futures::StreamExt;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
-// Bundle IDs of known Chromium-based browsers on macOS.
-// Used to validate that the default browser supports CDP before launching.
+// ---------------------------------------------------------------------------
+// Browser detection
+// ---------------------------------------------------------------------------
+
 #[cfg(target_os = "macos")]
 const CHROMIUM_BUNDLE_PREFIXES: &[&str] = &[
     "com.google.chrome",
@@ -41,11 +31,6 @@ const CHROMIUM_BUNDLE_PREFIXES: &[&str] = &[
     "com.vivaldi.vivaldi",
 ];
 
-/// Return the path to the default browser's executable.
-///
-/// Asks the OS directly — macOS via LaunchServices plist + mdfind,
-/// Linux via xdg-settings. Fails with a clear message if the default
-/// browser is not Chromium-based (Safari, Firefox, etc.).
 pub fn find_chromium_binary() -> Result<PathBuf> {
     #[cfg(target_os = "macos")]
     return find_chromium_binary_macos();
@@ -57,14 +42,11 @@ pub fn find_chromium_binary() -> Result<PathBuf> {
     anyhow::bail!("Windows browser detection not yet implemented");
 }
 
-/// macOS: read the LaunchServices plist for the default https handler,
-/// verify it is Chromium-based, then resolve its executable path.
 #[cfg(target_os = "macos")]
 fn find_chromium_binary_macos() -> Result<PathBuf> {
     let bundle_id = default_browser_bundle_id_macos()
         .context("could not read default browser from LaunchServices")?;
 
-    // Verify it's a browser that supports CDP before trying to launch it.
     let bundle_id_lower = bundle_id.to_lowercase();
     let is_chromium = CHROMIUM_BUNDLE_PREFIXES
         .iter()
@@ -83,12 +65,6 @@ fn find_chromium_binary_macos() -> Result<PathBuf> {
         .with_context(|| format!("found bundle {} but could not locate its executable", bundle_id))
 }
 
-/// Read ~/Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist
-/// and extract the bundle ID registered as the default https:// handler.
-///
-/// Uses `plutil -convert json` to get reliable JSON rather than parsing the
-/// human-readable plist text format, which has nested dicts that trip up
-/// simple line-by-line parsers.
 #[cfg(target_os = "macos")]
 fn default_browser_bundle_id_macos() -> Result<String> {
     let home = std::env::var("HOME").context("HOME not set")?;
@@ -97,7 +73,6 @@ fn default_browser_bundle_id_macos() -> Result<String> {
         home
     );
 
-    // plutil converts the binary/XML plist to JSON and writes it to stdout (-o -)
     let output = Command::new("plutil")
         .args(["-convert", "json", "-o", "-", &plist])
         .output()
@@ -106,9 +81,6 @@ fn default_browser_bundle_id_macos() -> Result<String> {
     let json: serde_json::Value =
         serde_json::from_slice(&output.stdout).context("plutil output was not valid JSON")?;
 
-    // LSHandlers is an array of dicts; each dict has LSHandlerURLScheme and LSHandlerRoleAll.
-    // Some dicts also have a nested LSHandlerPreferredVersions dict that contains its own
-    // LSHandlerRoleAll = "-" — we want the top-level one, which serde_json gives us directly.
     let handlers = json["LSHandlers"]
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("LSHandlers key not found in plist"))?;
@@ -124,12 +96,6 @@ fn default_browser_bundle_id_macos() -> Result<String> {
     anyhow::bail!("https handler not found in LaunchServices plist")
 }
 
-/// Scan /Applications for a .app whose CFBundleIdentifier matches `bundle_id`
-/// case-insensitively, then return the path to its executable binary.
-///
-/// We avoid mdfind here because LaunchServices and Spotlight index bundle IDs
-/// with inconsistent casing (e.g. LaunchServices stores "com.brave.browser"
-/// but the app's Info.plist and Spotlight index have "com.brave.Browser").
 #[cfg(target_os = "macos")]
 fn executable_for_bundle_macos(bundle_id: &str) -> Result<PathBuf> {
     let bundle_id_lower = bundle_id.to_lowercase();
@@ -148,7 +114,6 @@ fn executable_for_bundle_macos(bundle_id: &str) -> Result<PathBuf> {
             continue;
         }
 
-        // Read CFBundleIdentifier from the app's Info.plist
         let id_output = Command::new("defaults")
             .arg("read")
             .arg(app_path.join("Contents/Info").to_str().unwrap_or(""))
@@ -164,7 +129,6 @@ fn executable_for_bundle_macos(bundle_id: &str) -> Result<PathBuf> {
             continue;
         }
 
-        // Found the app — now get the binary name
         let exe_output = Command::new("defaults")
             .arg("read")
             .arg(app_path.join("Contents/Info").to_str().unwrap_or(""))
@@ -185,8 +149,6 @@ fn executable_for_bundle_macos(bundle_id: &str) -> Result<PathBuf> {
     anyhow::bail!("no .app found for bundle ID {}", bundle_id)
 }
 
-/// Linux: ask xdg-settings for the default browser desktop entry,
-/// then resolve the executable via the PATH.
 #[cfg(target_os = "linux")]
 fn find_chromium_binary_linux() -> Result<PathBuf> {
     let output = Command::new("xdg-settings")
@@ -200,44 +162,300 @@ fn find_chromium_binary_linux() -> Result<PathBuf> {
         .trim()
         .to_string();
 
-    // Desktop entry filename → likely binary name: e.g. "brave-browser.desktop" → "brave-browser"
     let bin_name = desktop_entry.trim_end_matches(".desktop");
 
     which::which(bin_name)
         .with_context(|| format!("default browser '{}' not found on PATH", bin_name))
 }
 
-/// Launch the Chromium browser at `binary`, navigate to `url`, and return the full page HTML.
+// ---------------------------------------------------------------------------
+// Connect to user's running browser
+// ---------------------------------------------------------------------------
+
+const DEBUG_PORT: u16 = 9222;
+
+/// Connect to the user's running browser. If it doesn't have remote debugging
+/// enabled, restart it with the flag (all tabs restore automatically).
+pub async fn get_browser(binary: &std::path::Path) -> Result<BrowserSession> {
+    // Try connecting to an already-debuggable browser
+    if let Ok(session) = try_connect(DEBUG_PORT).await {
+        println!("[browser] connected to running browser");
+        return Ok(session);
+    }
+
+    // Check DevToolsActivePort in case it's on a different port
+    if let Some(port) = find_debug_port(binary) {
+        if let Ok(session) = try_connect(port).await {
+            println!("[browser] connected on port {}", port);
+            return Ok(session);
+        }
+    }
+
+    // Browser isn't debuggable — restart it with remote debugging
+    println!("[browser] restarting with remote debugging...");
+    restart_with_debugging(binary).await?;
+
+    // Connect to the restarted browser
+    try_connect(DEBUG_PORT)
+        .await
+        .context("failed to connect after restart — is the browser running?")
+}
+
+/// Extract the macOS app name from the binary path.
+/// e.g. "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser" → "Brave Browser"
+#[cfg(target_os = "macos")]
+fn app_name(binary: &std::path::Path) -> String {
+    // Walk up to find the .app bundle and extract its name
+    let path_str = binary.to_string_lossy();
+    if let Some(start) = path_str.find("/Applications/") {
+        let after = &path_str[start + "/Applications/".len()..];
+        if let Some(end) = after.find(".app") {
+            return after[..end].to_string();
+        }
+    }
+    // Fallback: use the binary filename
+    binary
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Google Chrome".to_string())
+}
+
+/// Gracefully quit the running browser and relaunch with --remote-debugging-port.
+/// Brave/Chrome restore all tabs on restart.
+#[cfg(target_os = "macos")]
+async fn restart_with_debugging(binary: &std::path::Path) -> Result<()> {
+    let name = app_name(binary);
+
+    // Gracefully quit via AppleScript (preserves session for tab restore)
+    let quit_result = Command::new("osascript")
+        .arg("-e")
+        .arg(format!("tell application \"{}\" to quit", name))
+        .output();
+
+    if quit_result.is_err() {
+        anyhow::bail!("failed to quit {} — is it running?", name);
+    }
+
+    // Wait for it to fully shut down
+    println!("[browser] waiting for {} to quit...", name);
+    for _ in 0..10 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Check if the process is gone
+        let check = Command::new("pgrep")
+            .arg("-f")
+            .arg(&name)
+            .output();
+        if let Ok(output) = check {
+            if output.stdout.is_empty() {
+                break;
+            }
+        }
+    }
+
+    // Relaunch with remote debugging
+    println!("[browser] relaunching {} with remote debugging...", name);
+    Command::new("open")
+        .arg("-a")
+        .arg(&name)
+        .arg("--args")
+        .arg(format!("--remote-debugging-port={}", DEBUG_PORT))
+        .arg("--remote-allow-origins=*")
+        .arg("--disable-blink-features=AutomationControlled")
+        .arg("--disable-infobars")
+        .spawn()
+        .context("failed to relaunch browser")?;
+
+    // Wait for it to start and listen on the debug port.
+    // We only probe with an HTTP check, NOT a full Browser::connect,
+    // to avoid leaking a websocket connection + handler task.
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if debug_port_responding(DEBUG_PORT).await {
+            return Ok(());
+        }
+    }
+
+    anyhow::bail!("{} restarted but debug port {} not responding", name, DEBUG_PORT)
+}
+
+#[cfg(target_os = "linux")]
+async fn restart_with_debugging(binary: &std::path::Path) -> Result<()> {
+    // Kill existing browser
+    let _ = Command::new("pkill")
+        .arg("-f")
+        .arg(binary.to_string_lossy().as_ref())
+        .output();
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Relaunch with debug port
+    Command::new(binary)
+        .arg(format!("--remote-debugging-port={}", DEBUG_PORT))
+        .arg("--remote-allow-origins=*")
+        .arg("--disable-blink-features=AutomationControlled")
+        .arg("--disable-infobars")
+        .spawn()
+        .context("failed to relaunch browser")?;
+
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if debug_port_responding(DEBUG_PORT).await {
+            return Ok(());
+        }
+    }
+
+    anyhow::bail!("browser restarted but debug port {} not responding", DEBUG_PORT)
+}
+
+/// Lightweight probe: just check if the debug port's HTTP endpoint responds.
+/// Does NOT open a websocket connection (avoids leaking handler tasks).
+async fn debug_port_responding(port: u16) -> bool {
+    let url = format!("http://127.0.0.1:{}/json/version", port);
+    reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(1))
+        .send()
+        .await
+        .is_ok()
+}
+
+/// Check the browser's user data dir for DevToolsActivePort.
+fn find_debug_port(binary: &std::path::Path) -> Option<u16> {
+    let home = dirs::home_dir()?;
+    let bin_lower = binary.to_string_lossy().to_lowercase();
+
+    #[cfg(target_os = "macos")]
+    let data_dir = if bin_lower.contains("brave") {
+        home.join("Library/Application Support/BraveSoftware/Brave-Browser")
+    } else if bin_lower.contains("arc") {
+        home.join("Library/Application Support/Arc/User Data")
+    } else if bin_lower.contains("microsoft edge") || bin_lower.contains("msedge") {
+        home.join("Library/Application Support/Microsoft Edge")
+    } else {
+        home.join("Library/Application Support/Google/Chrome")
+    };
+
+    #[cfg(target_os = "linux")]
+    let data_dir = if bin_lower.contains("brave") {
+        home.join(".config/BraveSoftware/Brave-Browser")
+    } else {
+        home.join(".config/google-chrome")
+    };
+
+    #[cfg(target_os = "windows")]
+    let data_dir = home.join(r"AppData\Local\Google\Chrome\User Data");
+
+    let port_file = data_dir.join("DevToolsActivePort");
+    let contents = std::fs::read_to_string(port_file).ok()?;
+    contents.lines().next()?.trim().parse::<u16>().ok()
+}
+
+/// A connected browser session that can disconnect without closing the browser.
 ///
-/// The caller is expected to resolve the binary path once via find_chromium_binary()
-/// and pass it in — this avoids scanning /Applications on every call.
-pub async fn fetch_html(url: &str, binary: &std::path::Path) -> Result<String> {
-    let config = BrowserConfig::builder()
-        .chrome_executable(binary)
-        // Suppress first-run dialogs and default-browser prompts that block CDP
-        .arg("--no-first-run")
-        .arg("--no-default-browser-check")
-        .arg("--disable-default-apps")
-        // Visible window for development. Switch to HeadlessMode::True for benchmarking.
-        .headless_mode(HeadlessMode::False)
-        .build()
-        .map_err(|e| anyhow::anyhow!("BrowserConfig error: {}", e))?;
+/// The critical problem: chromiumoxide's `Browser::close()` sends the CDP
+/// `Browser.close` command which tells Chrome to shut down entirely.
+/// And when the process exits, tokio aborts the handler task, which drops
+/// the websocket abruptly (TCP RST, no close frame). Some Chromium-based
+/// browsers interpret an abrupt DevTools websocket disconnect as a signal
+/// to shut down.
+///
+/// The solution: abort the handler task explicitly before process exit.
+/// This drops the websocket connection. The browser stays alive because
+/// we never sent `Browser.close` — we just disconnected the DevTools client.
+pub struct BrowserSession {
+    pub browser: Browser,
+    handler_handle: tokio::task::JoinHandle<()>,
+}
 
-    let (browser, mut handler) = Browser::launch(config).await?;
+impl BrowserSession {
+    /// Disconnect from the browser without closing it.
+    ///
+    /// 1. Drops the `Browser` struct (closes the channel to the handler).
+    ///    The `Browser::drop` impl is a no-op for `connect()`-created browsers.
+    /// 2. Aborts the handler task, which drops the websocket.
+    ///
+    /// We intentionally never call `browser.close()` — that sends the CDP
+    /// `Browser.close` command which kills the browser process.
+    pub async fn disconnect(self) {
+        // Drop the browser — closes the mpsc channel to the handler.
+        // For connect()-created browsers, Browser::drop is a no-op (no child process).
+        drop(self.browser);
 
-    // The handler drives the CDP event loop. Must run concurrently or all
-    // browser calls will deadlock waiting for responses that never arrive.
-    //
-    // Do NOT break on errors — many CDP events are benign protocol noise.
-    // Breaking early closes the internal oneshot channels, which surfaces
-    // as "oneshot canceled" on every subsequent browser call.
-    tokio::spawn(async move {
+        // Abort the handler task. This drops the Handler and its Connection,
+        // which drops the WebSocketStream. The browser stays alive because
+        // we never sent the Browser.close CDP command.
+        self.handler_handle.abort();
+        let _ = self.handler_handle.await;
+    }
+}
+
+/// Try to connect to a browser on the given port via CDP.
+async fn try_connect(port: u16) -> Result<BrowserSession> {
+    let url = format!("http://127.0.0.1:{}/json/version", port);
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(1))
+        .send()
+        .await
+        .context("no browser")?;
+    let text = resp.text().await?;
+    let json: serde_json::Value = serde_json::from_str(&text)?;
+    let ws_url = json["webSocketDebuggerUrl"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("no webSocketDebuggerUrl"))?;
+
+    let (browser, mut handler) = Browser::connect(ws_url).await?;
+    let handler_handle = tokio::spawn(async move {
         while handler.next().await.is_some() {}
     });
+    Ok(BrowserSession {
+        browser,
+        handler_handle,
+    })
+}
 
+// ---------------------------------------------------------------------------
+// Page operations
+// ---------------------------------------------------------------------------
+
+pub type OpenedPageTracker = Arc<Mutex<HashSet<String>>>;
+
+/// Track only the tabs this process explicitly opens.
+pub fn new_opened_page_tracker() -> OpenedPageTracker {
+    Arc::new(Mutex::new(HashSet::new()))
+}
+
+/// Close only the tabs this process explicitly opened.
+/// Leaves the user's existing tabs untouched even if the browser's initial
+/// page enumeration was incomplete.
+pub async fn close_our_pages(browser: &Browser, opened_pages: &OpenedPageTracker) {
+    let opened_ids: HashSet<String> = {
+        let guard = opened_pages.lock().await;
+        guard.iter().cloned().collect()
+    };
+
+    if let Ok(pages) = browser.pages().await {
+        for page in pages {
+            let id = page.target_id().as_ref().to_owned();
+            if opened_ids.contains(&id) {
+                let _ = page.close().await;
+            }
+        }
+    }
+}
+
+/// Load a URL in a new tab and return the page HTML.
+pub async fn fetch_page(
+    browser: &Browser,
+    url: &str,
+    opened_pages: &OpenedPageTracker,
+) -> Result<String> {
     let page = browser.new_page(url).await?;
+    opened_pages
+        .lock()
+        .await
+        .insert(page.target_id().as_ref().to_owned());
     page.wait_for_navigation().await?;
     let html = page.content().await?;
-
     Ok(html)
 }

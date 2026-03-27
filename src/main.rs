@@ -1,19 +1,12 @@
 // main.rs — CLI entry point
 //
-// Phase 2: end-to-end integration.
-//   - Fetches page HTML via chromiumoxide (browser.rs)
-//   - Extracts clean prose text with Readability-style heuristics (extractor.rs)
-//   - Extracts links with rich context strings (extractor.rs)
-//   - Embeds query + page content + every link context (embedder.rs)
-//   - Prints page score and top-10 scored links to stdout
-//   - Copies page content to clipboard
-//
-// Done when: `cargo run -- --query "..." --start "https://..."` prints a page
-// score and a ranked list of links.
+// Connects to the user's running browser, navigates using embedding
+// similarity, copies all relevant pages to clipboard.
 
 mod browser;
 mod embedder;
 mod extractor;
+mod navigator;
 
 use anyhow::Result;
 use arboard::Clipboard;
@@ -35,79 +28,71 @@ struct Cli {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Validate start URL early so we get a clear error instead of silent link-drop failures
     url::Url::parse(&cli.start)
         .map_err(|e| anyhow::anyhow!("invalid --start URL '{}': {}", cli.start, e))?;
 
-    // --- Browser: fetch raw HTML ---
-    let binary = browser::find_chromium_binary()?;
-    println!("[browser] using binary: {}", binary.display());
-    println!("[browser] fetching {}", cli.start);
-    let html = browser::fetch_html(&cli.start, &binary).await?;
-    println!("[browser] fetched {} bytes of HTML", html.len());
-
-    // --- Embedder: load model, embed query once ---
-    println!("[embedder] loading model from models/");
+    // --- Embedder ---
+    println!("[embedder] loading model...");
     let mut embedder = embedder::Embedder::new("models/model.onnx", "models/tokenizer.json")?;
     let query_embedding = embedder.embed(&cli.query)?;
-    let preview: Vec<String> = query_embedding
-        .iter()
-        .take(4)
-        .map(|v| format!("{:.4}", v))
-        .collect();
-    println!(
-        "[embedder] query embedded ({} dims): [{}...]",
-        query_embedding.len(),
-        preview.join(", "),
-    );
+    println!("[embedder] query embedded ({} dims)", query_embedding.len());
 
-    // --- Extractor: clean prose from the page ---
-    let page_content = extractor::extract_page_content(&html);
-    println!(
-        "[extractor] extracted {} chars of clean content",
-        page_content.len()
-    );
+    // --- Browser: connect to running browser ---
+    let binary = browser::find_chromium_binary()?;
+    let session = browser::get_browser(&binary).await?;
+    let opened_pages = browser::new_opened_page_tracker();
 
-    // --- Score: how relevant is this page to the query? ---
-    let page_embedding = embedder.embed(&page_content)?;
-    let page_score: f32 = dot(&query_embedding, &page_embedding);
-    println!("[score] page relevance: {:.4}", page_score);
+    // --- Navigate ---
+    println!("[nav] starting from {}", cli.start);
+    let result = navigator::navigate(
+        &query_embedding,
+        &cli.start,
+        &session.browser,
+        &opened_pages,
+        &mut embedder,
+    )
+    .await?;
 
-    // --- Links: extract + score every link on the page ---
-    let links = extractor::extract_links(&html, &cli.start);
-    println!("[extractor] found {} links", links.len());
+    // --- Clean up our tabs (leave the user's tabs alone) ---
+    browser::close_our_pages(&session.browser, &opened_pages).await;
 
-    let mut scored: Vec<(f32, &str, &str)> = links
-        .iter()
-        .filter_map(|link| {
-            // Embed the context string; skip on error (malformed text etc.)
-            embedder
-                .embed(&link.context_string)
-                .ok()
-                .map(|emb| (dot(&query_embedding, &emb), link.url.as_str(), link.context_string.as_str()))
-        })
-        .collect();
+    // --- Disconnect from browser without closing it ---
+    session.disconnect().await;
 
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    println!("\n--- Top 10 links by relevance ---");
-    for (score, url, ctx) in scored.iter().take(10) {
-        // Print a truncated context string so it fits on one line
-        let preview: String = ctx.chars().take(100).collect();
-        println!("  {:.4}  {}  [{}...]", score, url, preview);
+    // --- Results ---
+    println!("\n--- Results (sorted by relevance) ---");
+    for (i, page) in result.pages.iter().enumerate() {
+        let preview: String = page.content.chars().take(80).collect();
+        println!(
+            "  {}. {:.4}  (hop {})  {}  [{}...]",
+            i + 1,
+            page.score,
+            page.hop,
+            page.url,
+            preview
+        );
     }
-    println!();
 
-    // --- Clipboard: copy page content for pasting into any LLM ---
+    // --- Clipboard: ALL pages, most relevant first ---
+    let mut clipboard_text = String::new();
+    for (i, page) in result.pages.iter().enumerate() {
+        clipboard_text.push_str(&format!(
+            "=== Page {} (score: {:.4}) ===\nURL: {}\n\n{}\n\n",
+            i + 1,
+            page.score,
+            page.url,
+            page.content
+        ));
+    }
+
+    let page_count = result.pages.len();
+    let char_count = clipboard_text.len();
     let mut clipboard = Clipboard::new()?;
-    clipboard.set_text(page_content)?;
-    println!("[clipboard] page content copied — paste into your LLM");
+    clipboard.set_text(clipboard_text)?;
+    println!(
+        "\n[clipboard] {} page(s) copied ({} chars) — paste into your LLM",
+        page_count, char_count
+    );
 
     Ok(())
-}
-
-/// Dot product of two equal-length vectors.
-/// Because embeddings are L2-normalized this equals cosine similarity.
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }

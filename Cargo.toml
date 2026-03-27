@@ -43,15 +43,18 @@ reqwest = { version = "0.12", features = ["blocking"] }
 # Clipboard access — final output is copied to clipboard for pasting into any LLM
 arboard = "3"
 
+# HTML parsing and DOM traversal
+scraper = "0.24"
+
 # PATH binary lookup — used by browser.rs to find Chromium on Linux
 which = "6"
-
-# HTML parsing for content extraction and link context building
-scraper = "0.21"
-
-# URL resolution for converting relative hrefs to absolute URLs
-url = "2"
 
 # Serialization — used by eval harness
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# URL resolution for converting relative hrefs to absolute URLs
+url = "2"
+
+# Cross-platform home directory — used by browser.rs to find Chrome profile path
+dirs = "5"

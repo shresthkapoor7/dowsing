@@ -8,12 +8,8 @@
 //   Prefers <article> or <main> as the content root, falls back to <body>.
 //   Skips <script>, <style>, <nav>, <header>, <footer>, <aside> subtrees.
 //
-// Link context format (what gets embedded):
+// Link context format:
 //   "heading: {nearest h1-h6} | text: {anchor text} | context: {parent block text} | url: {absolute url}"
-//
-// Why rich context strings: "Click here" is useless to an embedder.
-// "heading: NextAuth v5 Migration | text: configuration | context: see the
-//  configuration guide for auth options" is meaningful.
 
 use anyhow::Result;
 use scraper::{ElementRef, Html, Selector};
@@ -31,9 +27,6 @@ pub struct LinkContext {
 // ---------------------------------------------------------------------------
 
 /// Extract the main readable content from an HTML page as plain text.
-///
-/// Uses a Readability-style heuristic: prefer <article> or <main>, fall back
-/// to <body>. Strips script, style, nav, header, footer, and aside subtrees.
 pub fn extract_page_content(html: &str) -> String {
     let document = Html::parse_document(html);
 
@@ -43,11 +36,9 @@ pub fn extract_page_content(html: &str) -> String {
         collect_text(node, &mut text);
     }
 
-    // Collapse runs of whitespace
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Find the best content root element: <article>, <main>, [role="main"], or <body>.
 fn find_content_root(document: &Html) -> Option<ElementRef<'_>> {
     for selector_str in &[
         "article",
@@ -66,11 +57,9 @@ fn find_content_root(document: &Html) -> Option<ElementRef<'_>> {
     None
 }
 
-/// Recursively collect text from an element, skipping non-content subtrees.
 fn collect_text(node: ElementRef, out: &mut String) {
     let tag = node.value().name();
 
-    // Skip entire subtrees that aren't content
     if matches!(
         tag,
         "script" | "style" | "nav" | "header" | "footer" | "aside" | "noscript"
@@ -92,18 +81,11 @@ fn collect_text(node: ElementRef, out: &mut String) {
 // ---------------------------------------------------------------------------
 
 /// Extract all links from a page with rich context strings for embedding.
-///
-/// Walks the full document (including nav/header — Phase 3's nav-bar decay
-/// heuristic handles suppressing those). Tracks the nearest preceding heading
-/// and the parent block element text as context for each link.
-///
-/// Skips: fragment-only hrefs (#...), javascript: links, mailto:, empty anchor text.
 pub fn extract_links(html: &str, base_url: &str) -> Vec<LinkContext> {
     let document = Html::parse_document(html);
     let mut links = Vec::new();
     let mut current_heading = String::new();
 
-    // Walk from body so we capture links everywhere (nav bar decay handles noise in Phase 3)
     let body_sel = Selector::parse("body").unwrap();
     if let Some(body) = document.select(&body_sel).next() {
         walk_links(body, &mut current_heading, &mut links, base_url);
@@ -112,7 +94,6 @@ pub fn extract_links(html: &str, base_url: &str) -> Vec<LinkContext> {
     links
 }
 
-/// Recursive tree walk that tracks the current heading and emits LinkContext for each <a>.
 fn walk_links(
     node: ElementRef,
     current_heading: &mut String,
@@ -121,12 +102,10 @@ fn walk_links(
 ) {
     let tag = node.value().name();
 
-    // Don't descend into script/style — no links we care about there
     if matches!(tag, "script" | "style" | "noscript") {
         return;
     }
 
-    // Update current heading when we pass one
     if matches!(tag, "h1" | "h2" | "h3" | "h4" | "h5" | "h6") {
         let heading: String = node
             .text()
@@ -139,7 +118,6 @@ fn walk_links(
         }
     }
 
-    // Emit a LinkContext when we hit an <a href="...">
     if tag == "a" {
         if let Some(href) = node.value().attr("href") {
             let text: String = node
@@ -149,7 +127,6 @@ fn walk_links(
                 .collect::<Vec<_>>()
                 .join(" ");
 
-            // Skip empty text, fragment-only, and non-http schemes
             let skip = text.is_empty()
                 || href.starts_with('#')
                 || href.starts_with("javascript:")
@@ -179,7 +156,6 @@ fn walk_links(
         }
     }
 
-    // Recurse into children
     for child in node.children() {
         if let Some(el) = ElementRef::wrap(child) {
             walk_links(el, current_heading, links, base_url);
@@ -187,12 +163,7 @@ fn walk_links(
     }
 }
 
-/// Get the text of the nearest block-level ancestor as link context.
-///
-/// Walks up from the link element looking for a <p>, <li>, <td>, or <div>.
-/// Caps at 200 chars to keep context strings a reasonable embedding size.
 fn parent_block_text(link: ElementRef) -> String {
-    // Walk up through parent elements
     let mut node = link.parent();
     while let Some(parent_ref) = node {
         if let Some(parent_el) = ElementRef::wrap(parent_ref) {
@@ -205,7 +176,6 @@ fn parent_block_text(link: ElementRef) -> String {
                     .collect::<Vec<_>>()
                     .join(" ");
                 if !text.is_empty() {
-                    // Cap length so context strings stay reasonable
                     return text.chars().take(200).collect();
                 }
             }
@@ -217,14 +187,11 @@ fn parent_block_text(link: ElementRef) -> String {
     String::new()
 }
 
-/// Resolve a potentially-relative href to an absolute URL.
 fn resolve_url(base: &str, href: &str) -> Result<String> {
-    // Already absolute
     if href.starts_with("http://") || href.starts_with("https://") {
         return Ok(href.to_string());
     }
 
-    // Protocol-relative or relative — let url::Url handle it
     let base_url = url::Url::parse(base)
         .map_err(|e| anyhow::anyhow!("invalid base URL '{}': {}", base, e))?;
 
@@ -232,7 +199,6 @@ fn resolve_url(base: &str, href: &str) -> Result<String> {
         .join(href)
         .map_err(|e| anyhow::anyhow!("failed to resolve '{}' against '{}': {}", href, base, e))?;
 
-    // Only keep http/https
     if resolved.scheme() == "http" || resolved.scheme() == "https" {
         Ok(resolved.to_string())
     } else {
