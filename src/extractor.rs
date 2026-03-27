@@ -13,6 +13,7 @@
 
 use anyhow::Result;
 use scraper::{ElementRef, Html, Selector};
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct LinkContext {
@@ -102,7 +103,7 @@ pub fn extract_links(html: &str, base_url: &str) -> Vec<LinkContext> {
     // Then walk the full body to catch sidebar/nav links we missed
     let body_sel = Selector::parse("body").unwrap();
     if let Some(body) = document.select(&body_sel).next() {
-        let content_urls: std::collections::HashSet<String> =
+        let content_urls: HashSet<String> =
             links.iter().map(|l| l.url.clone()).collect();
         let mut nav_links = Vec::new();
         let mut nav_heading = String::new();
@@ -121,7 +122,7 @@ pub fn extract_links(html: &str, base_url: &str) -> Vec<LinkContext> {
 }
 
 fn dedup_links(links: &mut Vec<LinkContext>) {
-    let mut best: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut best: HashMap<String, usize> = HashMap::new();
     let mut to_remove = Vec::new();
 
     for (i, link) in links.iter().enumerate() {

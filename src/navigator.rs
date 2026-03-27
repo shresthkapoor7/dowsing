@@ -298,11 +298,8 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 // ---------------------------------------------------------------------------
 
 fn slug(url: &str) -> String {
-    url.replace("://", "_")
-        .replace('/', "_")
-        .replace('?', "_")
-        .replace('&', "_")
-        .chars()
+    url.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
         .take(80)
         .collect()
 }

@@ -113,12 +113,18 @@ async fn main() -> Result<()> {
         Err(_) => {
             // OSC 52 fallback for remote/SSH terminals
             use base64::Engine;
-            print!(
-                "\x1B]52;c;{}\x07",
-                base64::engine::general_purpose::STANDARD.encode(&clipboard_text)
-            );
+            use std::io::Write;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&clipboard_text);
+            if encoded.len() > 100_000 {
+                eprintln!(
+                    "\n[warning] clipboard content is large (~{}KB encoded) — some terminals may truncate OSC 52",
+                    encoded.len() / 1024
+                );
+            }
+            print!("\x1B]52;c;{}\x07", encoded);
+            let _ = std::io::stdout().flush();
             println!(
-                "\n[clipboard] {} page(s) copied via terminal (~{} tokens) — paste into your LLM",
+                "\n[clipboard] {} page(s) copied via terminal (~{} tokens) — paste into your LLM (OSC 52, not all terminals support this)",
                 page_count, token_count
             );
         }
