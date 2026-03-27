@@ -81,17 +81,66 @@ fn collect_text(node: ElementRef, out: &mut String) {
 // ---------------------------------------------------------------------------
 
 /// Extract all links from a page with rich context strings for embedding.
+///
+/// Walks content areas first (`<main>`, `<article>`) where headings are
+/// meaningful, then the full body for sidebar/nav links we missed.
+/// Deduplicates by URL, keeping the link with the longest context string.
 pub fn extract_links(html: &str, base_url: &str) -> Vec<LinkContext> {
     let document = Html::parse_document(html);
     let mut links = Vec::new();
     let mut current_heading = String::new();
 
-    let body_sel = Selector::parse("body").unwrap();
-    if let Some(body) = document.select(&body_sel).next() {
-        walk_links(body, &mut current_heading, &mut links, base_url);
+    // Walk content areas first — these have real, relevant headings
+    for sel_str in &["main", "article", r#"[role="main"]"#] {
+        if let Ok(sel) = Selector::parse(sel_str) {
+            if let Some(el) = document.select(&sel).next() {
+                walk_links(el, &mut current_heading, &mut links, base_url);
+            }
+        }
     }
 
+    // Then walk the full body to catch sidebar/nav links we missed
+    let body_sel = Selector::parse("body").unwrap();
+    if let Some(body) = document.select(&body_sel).next() {
+        let content_urls: std::collections::HashSet<String> =
+            links.iter().map(|l| l.url.clone()).collect();
+        let mut nav_links = Vec::new();
+        let mut nav_heading = String::new();
+        walk_links(body, &mut nav_heading, &mut nav_links, base_url);
+        for link in nav_links {
+            if !content_urls.contains(&link.url) {
+                links.push(link);
+            }
+        }
+    }
+
+    // Deduplicate by URL — keep the entry with the longest context string
+    dedup_links(&mut links);
+
     links
+}
+
+fn dedup_links(links: &mut Vec<LinkContext>) {
+    let mut best: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut to_remove = Vec::new();
+
+    for (i, link) in links.iter().enumerate() {
+        if let Some(&prev_idx) = best.get(&link.url) {
+            if link.context_string.len() > links[prev_idx].context_string.len() {
+                to_remove.push(prev_idx);
+                best.insert(link.url.clone(), i);
+            } else {
+                to_remove.push(i);
+            }
+        } else {
+            best.insert(link.url.clone(), i);
+        }
+    }
+
+    to_remove.sort_unstable();
+    for idx in to_remove.into_iter().rev() {
+        links.remove(idx);
+    }
 }
 
 fn walk_links(
@@ -104,6 +153,12 @@ fn walk_links(
 
     if matches!(tag, "script" | "style" | "noscript") {
         return;
+    }
+
+    // Reset heading when entering a content area — prevents headings from
+    // popups/help divs bleeding into content link contexts
+    if matches!(tag, "main" | "article") {
+        *current_heading = String::new();
     }
 
     if matches!(tag, "h1" | "h2" | "h3" | "h4" | "h5" | "h6") {

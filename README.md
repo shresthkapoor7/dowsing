@@ -28,28 +28,80 @@ Current focus: getting the end-to-end navigation loop working before optimizing 
 ## Usage
 
 ```bash
-# run navigator
-cargo run -- --query "how to configure auth in NextAuth v5" --start "https://authjs.dev"
+# download the embedding model (one-time)
+cargo run --bin download-model
 
-# run benchmark
-cargo run -- eval --dataset eval/webcode_rag.jsonl
+# navigate
+cargo run -- "how to configure auth in NextAuth v5" "https://authjs.dev"
+
+# with debug logs (writes raw HTML + extracted text to debug_logs/)
+cargo run -- "what is ownership in rust" "https://doc.rust-lang.org/book/" --debug
 ```
 
 ## How it works
 
-1. Embeds your query using `all-MiniLM-L6-v2` (23MB ONNX model, runs locally)
-2. Loads the start URL in Chrome using your existing browser session
-3. Extracts links with context strings (heading + anchor text + surrounding paragraph)
-4. Scores each link by cosine similarity to the query embedding
-5. Follows the best link, repeats until a high-relevance page is found or max depth is hit
-6. Copies the page content to clipboard
+### Overview
+
+1. Embed your query once using `all-MiniLM-L6-v2` (23MB ONNX model, runs locally)
+2. Connect to your running browser via Chrome DevTools Protocol
+3. Navigate autonomously using embedding similarity to pick the best links
+4. Copy all relevant pages to clipboard, sorted by relevance
+
+### Browser connection
+
+Dowsing connects to your **running browser** — it doesn't launch a new instance or copy your profile. It opens tabs in your existing session, so authenticated pages just work. When it's done, it closes only the tabs it opened and disconnects, leaving your browser untouched.
+
+If your browser doesn't have remote debugging enabled, dowsing restarts it with `--remote-debugging-port=9222`. Chromium-based browsers restore all tabs on restart.
+
+### Content extraction
+
+Raw HTML is full of nav bars, footers, and cookie banners. Before embedding a page, dowsing extracts the main content:
+
+- Prefers `<article>` or `<main>` as the content root, falls back to `<body>`
+- Strips `<script>`, `<style>`, `<nav>`, `<header>`, `<footer>`, `<aside>` subtrees
+- Collapses whitespace into clean prose text
+
+### Link context
+
+Anchor text alone is useless to an embedder ("Click here" means nothing). For each link, dowsing builds a rich context string:
+
+```
+heading: NextAuth v5 Migration | text: configuration | context: see the configuration guide for auth options | url: https://...
+```
+
+This context string is what gets embedded and compared to the query. Links from content areas (`<main>`, `<article>`) are prioritized over sidebar/nav links, and duplicates are removed.
+
+### Navigation loop
+
+Each hop:
+
+1. Fetch the current page, extract content, embed it, score against the query
+2. Extract all links with context strings
+3. Filter to same-domain links (prevents drifting to external sites)
+4. Score each link's context string against the query embedding
+5. Apply nav-bar decay: links appearing on >50% of visited pages get their score multiplied by 0.3
+6. Fetch the top 3 candidates **in parallel** (beam search)
+7. Score each candidate page, pick the best to continue from
+
+The loop stops when:
+- A page scores above the threshold (0.55)
+- No candidate beats the current best score (peak detection)
+- Max depth (10 hops) is reached
+- No unvisited links remain
+
+Dead-end detection: if scores drop for 2 consecutive hops, dowsing skips the top-ranked link and tries alternatives instead.
+
+### Output
+
+All visited pages are collected, deduplicated by URL, sorted by score, and copied to clipboard with metadata. Token count (GPT-4o tokenizer) is shown so you know if it fits your LLM's context window.
 
 ## Tech
 
-- `chromiumoxide` for Chrome DevTools Protocol browser control
-- `ort` for local ONNX inference
-- `tokenizers` for HuggingFace tokenizer
-- Flat cosine similarity search (no HNSW, no vector DB, just math)
+- `chromiumoxide` — Chrome DevTools Protocol, connects to running browser
+- `ort` — ONNX Runtime, runs all-MiniLM-L6-v2 locally
+- `tokenizers` — HuggingFace tokenizer for the embedding model
+- `tiktoken-rs` — GPT-4o tokenizer for output token counting
+- Flat dot-product search (no HNSW, no vector DB — just math)
 
 ## Benchmarking
 

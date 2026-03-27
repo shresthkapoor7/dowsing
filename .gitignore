@@ -7,5 +7,8 @@
 # Eval results output
 results.json
 
+# Debug logs from --debug mode
+/debug_logs/
+
 # macOS
 .DS_Store
