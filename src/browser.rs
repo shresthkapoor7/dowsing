@@ -376,19 +376,29 @@ fn find_debug_port(binary: &std::path::Path) -> Option<u16> {
         home.join("Library/Application Support/Arc/User Data")
     } else if bin_lower.contains("microsoft edge") || bin_lower.contains("msedge") {
         home.join("Library/Application Support/Microsoft Edge")
-    } else {
+    } else if bin_lower.contains("google chrome") || bin_lower.contains("google/chrome") {
         home.join("Library/Application Support/Google/Chrome")
+    } else {
+        // Unknown Chromium variant (e.g. Helium) — no known data dir mapping,
+        // so don't guess Chrome's path or we'd read Chrome's DevToolsActivePort.
+        return None;
     };
 
     #[cfg(target_os = "linux")]
     let data_dir = if bin_lower.contains("brave") {
         home.join(".config/BraveSoftware/Brave-Browser")
-    } else {
+    } else if bin_lower.contains("google-chrome") || bin_lower.contains("google/chrome") {
         home.join(".config/google-chrome")
+    } else {
+        return None;
     };
 
     #[cfg(target_os = "windows")]
-    let data_dir = home.join(r"AppData\Local\Google\Chrome\User Data");
+    let data_dir = if bin_lower.contains("google") && bin_lower.contains("chrome") {
+        home.join(r"AppData\Local\Google\Chrome\User Data")
+    } else {
+        return None;
+    };
 
     let port_file = data_dir.join("DevToolsActivePort");
     let contents = std::fs::read_to_string(port_file).ok()?;
@@ -506,14 +516,13 @@ pub async fn fetch_page(
         .insert(page.target_id().as_ref().to_owned());
     page.wait_for_navigation().await?;
 
-    // Wait for the page to settle — poll DOM length until it stabilizes
-    let mut last_len = 0usize;
+    // Wait for the page to settle — poll DOM until HTML stabilizes exactly
+    let mut last_html: Option<String> = None;
     let mut stable_count = 0u8;
     for _ in 0..20 {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let html = page.content().await.unwrap_or_default();
-        let len = html.len();
-        if len > 0 && (len.abs_diff(last_len) < 200) {
+        let html = page.content().await?;
+        if !html.is_empty() && last_html.as_deref() == Some(&html) {
             stable_count += 1;
             if stable_count >= 2 {
                 return Ok(html);
@@ -521,7 +530,7 @@ pub async fn fetch_page(
         } else {
             stable_count = 0;
         }
-        last_len = len;
+        last_html = Some(html);
     }
 
     // Fallback: return whatever we have after the wait
