@@ -1,11 +1,12 @@
 [package]
-name = "semantic-navigator"
+name = "dowsing"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"  # ort 2.0.0-rc.12 requires edition 2024 internally, MSRV 1.88
+default-run = "dowsing"
 
 [[bin]]
-name = "semantic-navigator"
+name = "dowsing"
 path = "src/main.rs"
 
 [[bin]]
@@ -58,3 +59,9 @@ url = "2"
 
 # Cross-platform home directory — used by browser.rs to find Chrome profile path
 dirs = "5"
+
+# Token counting — matches GPT-4o tokenizer for accurate token estimates
+tiktoken-rs = "0.6"
+
+# Base64 encoding — used for OSC 52 clipboard fallback in remote terminals
+base64 = "0.22"

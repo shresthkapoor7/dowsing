@@ -18,6 +18,7 @@ use crate::extractor;
 use anyhow::Result;
 use chromiumoxide::Browser;
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 
 const MAX_DEPTH: usize = 10;
 const THRESHOLD: f32 = 0.55;
@@ -43,6 +44,7 @@ pub async fn navigate(
     browser: &Browser,
     opened_pages: &browser::OpenedPageTracker,
     embedder: &mut Embedder,
+    debug: bool,
 ) -> Result<NavResult> {
     let start_domain = domain(start_url);
 
@@ -66,8 +68,16 @@ pub async fn navigate(
             browser::fetch_page(browser, &current_url, opened_pages).await?
         };
 
+        if debug {
+            debug_log_raw_html(hop, &current_url, &html);
+        }
+
         let page_content = extractor::extract_page_content(&html);
         let word_count = page_content.split_whitespace().count();
+
+        if debug {
+            debug_log_extracted(hop, &current_url, &page_content, word_count);
+        }
 
         if page_content.is_empty() || word_count < MIN_WORDS {
             println!(
@@ -104,7 +114,11 @@ pub async fn navigate(
         visited.insert(current_url.clone());
 
         // --- Link extraction and scoring ---
-        let links = extractor::extract_links(&html, &current_url);
+        let all_extracted_links = extractor::extract_links(&html, &current_url);
+        if debug {
+            debug_log_links(hop, &all_extracted_links);
+        }
+        let links = all_extracted_links;
         let links: Vec<_> = links
             .into_iter()
             .filter(|l| !visited.contains(&l.url))
@@ -150,6 +164,10 @@ pub async fn navigate(
 
         scored_links.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
+        if debug {
+            debug_log_scored_links(hop, &scored_links);
+        }
+
         if scored_links.is_empty() {
             println!("[nav] no scorable links — stopping");
             break;
@@ -192,8 +210,14 @@ pub async fn navigate(
         for (url, result) in &fetch_results {
             visited.insert(url.clone());
             if let Ok(page_html) = result {
+                if debug {
+                    debug_log_raw_html(hop + 1, url, page_html);
+                }
                 let content = extractor::extract_page_content(page_html);
                 let wc = content.split_whitespace().count();
+                if debug {
+                    debug_log_extracted(hop + 1, url, &content, wc);
+                }
                 if wc < MIN_WORDS {
                     println!("        skip ({} words)  {}", wc, url);
                     continue;
@@ -267,4 +291,56 @@ fn domain(url: &str) -> Option<String> {
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+// ---------------------------------------------------------------------------
+// Debug logging helpers
+// ---------------------------------------------------------------------------
+
+fn slug(url: &str) -> String {
+    url.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .take(80)
+        .collect()
+}
+
+fn debug_log_raw_html(hop: usize, url: &str, html: &str) {
+    let path = format!("debug_logs/hop{}_{}_raw.html", hop, slug(url));
+    if let Ok(mut f) = std::fs::File::create(&path) {
+        let _ = f.write_all(html.as_bytes());
+    }
+}
+
+fn debug_log_extracted(hop: usize, url: &str, content: &str, word_count: usize) {
+    let path = format!("debug_logs/hop{}_{}_extracted.txt", hop, slug(url));
+    if let Ok(mut f) = std::fs::File::create(&path) {
+        let _ = writeln!(f, "URL: {}", url);
+        let _ = writeln!(f, "Word count: {}", word_count);
+        let _ = writeln!(f, "---");
+        let _ = f.write_all(content.as_bytes());
+    }
+}
+
+fn debug_log_links(hop: usize, links: &[extractor::LinkContext]) {
+    let path = format!("debug_logs/hop{}_links.txt", hop);
+    if let Ok(mut f) = std::fs::File::create(&path) {
+        let _ = writeln!(f, "Total links extracted: {}", links.len());
+        let _ = writeln!(f, "---");
+        for (i, link) in links.iter().enumerate() {
+            let _ = writeln!(f, "{}. {}", i + 1, link.url);
+            let _ = writeln!(f, "   context: {}", link.context_string);
+            let _ = writeln!(f);
+        }
+    }
+}
+
+fn debug_log_scored_links(hop: usize, scored: &[(f32, &str)]) {
+    let path = format!("debug_logs/hop{}_scored.txt", hop);
+    if let Ok(mut f) = std::fs::File::create(&path) {
+        let _ = writeln!(f, "Scored links (sorted by score desc):");
+        let _ = writeln!(f, "---");
+        for (i, (score, url)) in scored.iter().enumerate() {
+            let _ = writeln!(f, "{}. {:.4}  {}", i + 1, score, url);
+        }
+    }
 }

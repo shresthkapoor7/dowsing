@@ -13,15 +13,17 @@ use arboard::Clipboard;
 use clap::Parser;
 
 #[derive(Parser)]
-#[command(name = "semantic-navigator")]
+#[command(name = "dowsing")]
 struct Cli {
     /// The question to answer / page to find
-    #[arg(long)]
     query: String,
 
     /// Starting URL
-    #[arg(long)]
     start: String,
+
+    /// Write debug logs (raw HTML, extracted text, link contexts) to debug_logs/
+    #[arg(long, default_value_t = false)]
+    debug: bool,
 }
 
 #[tokio::main]
@@ -42,6 +44,16 @@ async fn main() -> Result<()> {
     let session = browser::get_browser(&binary).await?;
     let opened_pages = browser::new_opened_page_tracker();
 
+    // --- Debug setup ---
+    if cli.debug {
+        let log_dir = std::path::Path::new("debug_logs");
+        if log_dir.exists() {
+            std::fs::remove_dir_all(log_dir)?;
+        }
+        std::fs::create_dir_all(log_dir)?;
+        println!("[debug] logging to debug_logs/");
+    }
+
     // --- Navigate ---
     println!("[nav] starting from {}", cli.start);
     let result = navigator::navigate(
@@ -50,6 +62,7 @@ async fn main() -> Result<()> {
         &session.browser,
         &opened_pages,
         &mut embedder,
+        cli.debug,
     )
     .await?;
 
@@ -86,13 +99,36 @@ async fn main() -> Result<()> {
     }
 
     let page_count = result.pages.len();
-    let char_count = clipboard_text.len();
-    let mut clipboard = Clipboard::new()?;
-    clipboard.set_text(clipboard_text)?;
-    println!(
-        "\n[clipboard] {} page(s) copied ({} chars) — paste into your LLM",
-        page_count, char_count
-    );
+    let bpe = tiktoken_rs::get_bpe_from_model("gpt-4o")
+        .map_err(|e| anyhow::anyhow!("tiktoken init failed: {}", e))?;
+    let token_count = bpe.encode_with_special_tokens(&clipboard_text).len();
+
+    match Clipboard::new().and_then(|mut cb| cb.set_text(clipboard_text.clone())) {
+        Ok(_) => {
+            println!(
+                "\n[clipboard] {} page(s) copied (~{} tokens) — paste into your LLM",
+                page_count, token_count
+            );
+        }
+        Err(_) => {
+            // OSC 52 fallback for remote/SSH terminals
+            use base64::Engine;
+            use std::io::Write;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&clipboard_text);
+            if encoded.len() > 100_000 {
+                eprintln!(
+                    "\n[warning] clipboard content is large (~{}KB encoded) — some terminals may truncate OSC 52",
+                    encoded.len() / 1024
+                );
+            }
+            print!("\x1B]52;c;{}\x07", encoded);
+            let _ = std::io::stdout().flush();
+            println!(
+                "\n[clipboard] {} page(s) copied via terminal (~{} tokens) — paste into your LLM (OSC 52, not all terminals support this)",
+                page_count, token_count
+            );
+        }
+    }
 
     Ok(())
 }
