@@ -20,6 +20,8 @@ use tokio::sync::Mutex;
 // Browser detection
 // ---------------------------------------------------------------------------
 
+/// Known Chromium bundle IDs as a fast path. If the default browser isn't
+/// in this list, we fall back to checking for chrome_*.pak framework files.
 #[cfg(target_os = "macos")]
 const CHROMIUM_BUNDLE_PREFIXES: &[&str] = &[
     "com.google.chrome",
@@ -29,6 +31,7 @@ const CHROMIUM_BUNDLE_PREFIXES: &[&str] = &[
     "org.chromium.chromium",
     "com.operasoftware.opera",
     "com.vivaldi.vivaldi",
+    "net.imput.helium",
 ];
 
 pub fn find_chromium_binary() -> Result<PathBuf> {
@@ -48,21 +51,30 @@ fn find_chromium_binary_macos() -> Result<PathBuf> {
         .context("could not read default browser from LaunchServices")?;
 
     let bundle_id_lower = bundle_id.to_lowercase();
-    let is_chromium = CHROMIUM_BUNDLE_PREFIXES
+    let known = CHROMIUM_BUNDLE_PREFIXES
         .iter()
         .any(|prefix| bundle_id_lower.starts_with(prefix));
 
-    if !is_chromium {
-        anyhow::bail!(
-            "your default browser (bundle ID: {}) does not support CDP.\n\
-             This tool requires a Chromium-based browser: Arc, Chrome, Brave, or Edge.\n\
-             Change your default browser in System Settings → Desktop & Dock → Default web browser.",
-            bundle_id
-        );
+    // Fast path: known Chromium browser
+    if known {
+        return executable_for_bundle_macos(&bundle_id)
+            .with_context(|| format!("found bundle {} but could not locate its executable", bundle_id));
     }
 
-    executable_for_bundle_macos(&bundle_id)
-        .with_context(|| format!("found bundle {} but could not locate its executable", bundle_id))
+    // Slow path: check if the app has Chromium framework files (chrome_*.pak)
+    // This catches any Chromium-based browser we don't know about yet
+    if let Ok(exe) = executable_for_bundle_macos(&bundle_id) {
+        if is_chromium_app_macos(&exe) {
+            return Ok(exe);
+        }
+    }
+
+    anyhow::bail!(
+        "your default browser (bundle ID: {}) does not appear to be Chromium-based.\n\
+         This tool requires a Chromium-based browser (Chrome, Brave, Arc, Edge, Helium, etc.).\n\
+         Change your default browser in System Settings → Desktop & Dock → Default web browser.",
+        bundle_id
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -147,6 +159,39 @@ fn executable_for_bundle_macos(bundle_id: &str) -> Result<PathBuf> {
     }
 
     anyhow::bail!("no .app found for bundle ID {}", bundle_id)
+}
+
+/// Check if a macOS app is Chromium-based by looking for chrome_*.pak files
+/// in its Frameworks directory. Every Chromium-based browser ships these.
+#[cfg(target_os = "macos")]
+fn is_chromium_app_macos(binary: &std::path::Path) -> bool {
+    // Walk up from binary to find the .app bundle
+    let path_str = binary.to_string_lossy();
+    let app_end = match path_str.find(".app/") {
+        Some(pos) => pos + 4, // include ".app"
+        None => return false,
+    };
+    let app_path = std::path::Path::new(&path_str[..app_end]);
+    let frameworks = app_path.join("Contents/Frameworks");
+    if let Ok(entries) = std::fs::read_dir(&frameworks) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // Look inside *.framework/Resources/ for chrome_*.pak
+            if path.extension().and_then(|e| e.to_str()) == Some("framework") {
+                let resources = path.join("Resources");
+                if let Ok(res_entries) = std::fs::read_dir(&resources) {
+                    for res in res_entries.flatten() {
+                        let name = res.file_name();
+                        let name = name.to_string_lossy();
+                        if name.starts_with("chrome_") && name.ends_with(".pak") {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 #[cfg(target_os = "linux")]
@@ -331,19 +376,29 @@ fn find_debug_port(binary: &std::path::Path) -> Option<u16> {
         home.join("Library/Application Support/Arc/User Data")
     } else if bin_lower.contains("microsoft edge") || bin_lower.contains("msedge") {
         home.join("Library/Application Support/Microsoft Edge")
-    } else {
+    } else if bin_lower.contains("google chrome") || bin_lower.contains("google/chrome") {
         home.join("Library/Application Support/Google/Chrome")
+    } else {
+        // Unknown Chromium variant (e.g. Helium) — no known data dir mapping,
+        // so don't guess Chrome's path or we'd read Chrome's DevToolsActivePort.
+        return None;
     };
 
     #[cfg(target_os = "linux")]
     let data_dir = if bin_lower.contains("brave") {
         home.join(".config/BraveSoftware/Brave-Browser")
-    } else {
+    } else if bin_lower.contains("google-chrome") || bin_lower.contains("google/chrome") {
         home.join(".config/google-chrome")
+    } else {
+        return None;
     };
 
     #[cfg(target_os = "windows")]
-    let data_dir = home.join(r"AppData\Local\Google\Chrome\User Data");
+    let data_dir = if bin_lower.contains("google") && bin_lower.contains("chrome") {
+        home.join(r"AppData\Local\Google\Chrome\User Data")
+    } else {
+        return None;
+    };
 
     let port_file = data_dir.join("DevToolsActivePort");
     let contents = std::fs::read_to_string(port_file).ok()?;
@@ -445,6 +500,10 @@ pub async fn close_our_pages(browser: &Browser, opened_pages: &OpenedPageTracker
 }
 
 /// Load a URL in a new tab and return the page HTML.
+///
+/// Waits for initial navigation, then polls the DOM until it stabilizes.
+/// SPAs like LinkedIn render content via JS after the initial load event —
+/// without this wait, we'd get skeleton/shimmer HTML with zero content.
 pub async fn fetch_page(
     browser: &Browser,
     url: &str,
@@ -456,6 +515,25 @@ pub async fn fetch_page(
         .await
         .insert(page.target_id().as_ref().to_owned());
     page.wait_for_navigation().await?;
+
+    // Wait for the page to settle — poll DOM until HTML stabilizes exactly
+    let mut last_html: Option<String> = None;
+    let mut stable_count = 0u8;
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let html = page.content().await?;
+        if !html.is_empty() && last_html.as_deref() == Some(&html) {
+            stable_count += 1;
+            if stable_count >= 2 {
+                return Ok(html);
+            }
+        } else {
+            stable_count = 0;
+        }
+        last_html = Some(html);
+    }
+
+    // Fallback: return whatever we have after the wait
     let html = page.content().await?;
     Ok(html)
 }

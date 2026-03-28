@@ -222,6 +222,10 @@ semantic-navigator eval --dataset eval/webcode_rag.jsonl --output results.json
 semantic-navigator eval --dataset eval/webcode_rag.jsonl --compare browser-use
 ```
 
+## Commit message convention
+
+All commit messages should be prefixed with `dowsing:` — e.g. `dowsing: fix debug port fallback`.
+
 ## Build and run
 
 ```bash
