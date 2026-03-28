@@ -26,6 +26,7 @@ const BEAM: usize = 3;
 const MIN_WORDS: usize = 50; // pages with fewer words are stubs/indexes — skip scoring
 
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct PageResult {
     pub url: String,
     pub content: String,
@@ -36,6 +37,17 @@ pub struct PageResult {
 pub struct NavResult {
     /// All pages found, sorted by score descending
     pub pages: Vec<PageResult>,
+    /// Total hops taken
+    pub hops: usize,
+}
+
+/// Print only when debug mode is on.
+macro_rules! dbg_print {
+    ($debug:expr, $($arg:tt)*) => {
+        if $debug {
+            println!($($arg)*);
+        }
+    };
 }
 
 pub async fn navigate(
@@ -55,16 +67,19 @@ pub async fn navigate(
     let mut current_url = start_url.to_string();
     let mut cached_html: Option<(String, String)> = None;
     let mut best_score: f32 = f32::NEG_INFINITY;
+    let mut total_hops: usize = 0;
 
     for hop in 0..MAX_DEPTH {
+        total_hops = hop + 1;
+
         let html = if cached_html
             .as_ref()
             .map_or(false, |(u, _)| u == &current_url)
         {
-            println!("[hop {}] {} (cached)", hop, current_url);
+            dbg_print!(debug, "[hop {}] {} (cached)", hop, current_url);
             cached_html.take().unwrap().1
         } else {
-            println!("[hop {}] fetching {}", hop, current_url);
+            dbg_print!(debug, "[hop {}] fetching {}", hop, current_url);
             browser::fetch_page(browser, &current_url, opened_pages).await?
         };
 
@@ -80,18 +95,13 @@ pub async fn navigate(
         }
 
         if page_content.is_empty() || word_count < MIN_WORDS {
-            println!(
-                "[hop {}] stub page ({} words) — skipping score",
-                hop, word_count
-            );
+            dbg_print!(debug, "[hop {}] stub page ({} words) — skipping score", hop, word_count);
             visited.insert(current_url.clone());
-            // Don't break — try to extract links and continue
         } else {
             let page_embedding = embedder.embed(&page_content)?;
             let page_score = dot(query_embedding, &page_embedding);
-            println!("[hop {}] score: {:.4}  ({} words)  {}", hop, page_score, word_count, current_url);
+            dbg_print!(debug, "[hop {}] score: {:.4}  ({} words)  {}", hop, page_score, word_count, current_url);
 
-            // Collect every real page we visit
             all_pages.push(PageResult {
                 url: current_url.clone(),
                 content: page_content,
@@ -104,7 +114,7 @@ pub async fn navigate(
             }
 
             if page_score >= THRESHOLD {
-                println!("[nav] score {:.4} >= threshold {:.2} — stopping", page_score, THRESHOLD);
+                dbg_print!(debug, "[nav] score {:.4} >= threshold {:.2} — stopping", page_score, THRESHOLD);
                 break;
             }
 
@@ -125,7 +135,7 @@ pub async fn navigate(
             .collect();
 
         if links.is_empty() {
-            println!("[nav] no unvisited links — stopping");
+            dbg_print!(debug, "[nav] no unvisited links — stopping");
             break;
         }
 
@@ -136,7 +146,7 @@ pub async fn navigate(
             .collect();
 
         let scoring_pool: Vec<&extractor::LinkContext> = if same_domain.is_empty() {
-            println!("[nav] no same-domain links — allowing cross-domain");
+            dbg_print!(debug, "[nav] no same-domain links — allowing cross-domain");
             links.iter().collect()
         } else {
             same_domain
@@ -147,18 +157,26 @@ pub async fn navigate(
         }
 
         let hop_count = (hop + 1) as f32;
+
+        // Batch-embed all link context strings in a single ONNX call
+        let context_strs: Vec<&str> = scoring_pool
+            .iter()
+            .map(|l| l.context_string.as_str())
+            .collect();
+        let embeddings = embedder.embed_batch(&context_strs)?;
+
         let mut scored_links: Vec<(f32, &str)> = scoring_pool
             .iter()
-            .filter_map(|link| {
-                let emb = embedder.embed(&link.context_string).ok()?;
-                let mut score = dot(query_embedding, &emb);
+            .zip(embeddings.iter())
+            .map(|(link, emb)| {
+                let mut score = dot(query_embedding, emb);
 
                 let freq = *link_frequency.get(&link.url).unwrap_or(&0) as f32;
                 if freq / hop_count > 0.5 {
                     score *= 0.3;
                 }
 
-                Some((score, link.url.as_str()))
+                (score, link.url.as_str())
             })
             .collect();
 
@@ -169,7 +187,7 @@ pub async fn navigate(
         }
 
         if scored_links.is_empty() {
-            println!("[nav] no scorable links — stopping");
+            dbg_print!(debug, "[nav] no scorable links — stopping");
             break;
         }
 
@@ -179,15 +197,17 @@ pub async fn navigate(
             && score_history[score_history.len() - 2] < score_history[score_history.len() - 3];
 
         let candidates: Vec<&str> = if is_dead_end && scored_links.len() > 1 {
-            println!("[nav] 2 consecutive drops — trying alternative links");
+            dbg_print!(debug, "[nav] 2 consecutive drops — trying alternative links");
             scored_links[1..].iter().take(BEAM).map(|(_, u)| *u).collect()
         } else {
             scored_links.iter().take(BEAM).map(|(_, u)| *u).collect()
         };
 
-        println!("[hop {}] fetching {} candidate(s):", hop, candidates.len());
-        for c in &candidates {
-            println!("        {}", c);
+        dbg_print!(debug, "[hop {}] fetching {} candidate(s):", hop, candidates.len());
+        if debug {
+            for c in &candidates {
+                println!("        {}", c);
+            }
         }
 
         let fetch_results: Vec<(String, Result<String>)> = futures::future::join_all(
@@ -219,12 +239,12 @@ pub async fn navigate(
                     debug_log_extracted(hop + 1, url, &content, wc);
                 }
                 if wc < MIN_WORDS {
-                    println!("        skip ({} words)  {}", wc, url);
+                    dbg_print!(debug, "        skip ({} words)  {}", wc, url);
                     continue;
                 }
                 if let Ok(emb) = embedder.embed(&content) {
                     let s = dot(query_embedding, &emb);
-                    println!("        {:.4}  ({} words)  {}", s, wc, url);
+                    dbg_print!(debug, "        {:.4}  ({} words)  {}", s, wc, url);
 
                     all_pages.push(PageResult {
                         url: url.clone(),
@@ -244,7 +264,8 @@ pub async fn navigate(
 
         // Stop if a parallel candidate cleared the threshold
         if best_next_score >= THRESHOLD {
-            println!(
+            dbg_print!(
+                debug,
                 "[nav] candidate scored {:.4} >= {:.2} — stopping",
                 best_next_score, THRESHOLD
             );
@@ -254,7 +275,8 @@ pub async fn navigate(
         // Peak detection: if none of the candidates beat the current best,
         // we've reached the most relevant area. Stop exploring.
         if best_next_score < best_score {
-            println!(
+            dbg_print!(
+                debug,
                 "[nav] peaked — no candidate ({:.4}) beats best ({:.4}), stopping",
                 best_next_score, best_score
             );
@@ -280,7 +302,10 @@ pub async fn navigate(
         anyhow::bail!("navigation produced no results");
     }
 
-    Ok(NavResult { pages: all_pages })
+    Ok(NavResult {
+        pages: all_pages,
+        hops: total_hops,
+    })
 }
 
 fn domain(url: &str) -> Option<String> {
