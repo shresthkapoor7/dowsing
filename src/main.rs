@@ -104,7 +104,7 @@ async fn main() -> Result<()> {
             let encoded = base64::engine::general_purpose::STANDARD.encode(&clipboard_text);
             print!("\x1B]52;c;{}\x07", encoded);
             let _ = std::io::stdout().flush();
-            true
+            false
         }
     };
 
@@ -132,6 +132,8 @@ async fn main() -> Result<()> {
 
     if clipboard_ok {
         println!("\nCopied to clipboard.");
+    } else {
+        println!("\nCopied to clipboard via terminal (OSC 52).");
     }
 
     Ok(())

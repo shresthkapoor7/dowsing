@@ -32,7 +32,7 @@ const MAX_CHARS: usize = 1800; // ~512 tokens at ~3.5 chars/token average
 pub struct Embedder {
     session: Session,
     tokenizer: Tokenizer,
-    cache: HashMap<u64, Vec<f32>>,
+    cache: HashMap<u64, (String, Vec<f32>)>,
 }
 
 impl Embedder {
@@ -75,7 +75,13 @@ impl Embedder {
             .map(|t| {
                 let t = t.trim();
                 if t.len() > MAX_CHARS {
-                    &t[..MAX_CHARS]
+                    // Find a safe byte boundary to avoid splitting multi-byte UTF-8
+                    let safe_end = t
+                        .char_indices()
+                        .nth(MAX_CHARS)
+                        .map(|(i, _)| i)
+                        .unwrap_or(t.len());
+                    &t[..safe_end]
                 } else {
                     t
                 }
@@ -84,11 +90,17 @@ impl Embedder {
 
         let keys: Vec<u64> = truncated.iter().map(|t| hash_text(t)).collect();
 
-        // Find which indices need embedding (not in cache)
+        // Find which indices need embedding (not in cache or hash collision)
         let uncached: Vec<usize> = keys
             .iter()
+            .zip(truncated.iter())
             .enumerate()
-            .filter(|(_, k)| !self.cache.contains_key(k))
+            .filter(|(_, (k, text))| {
+                match self.cache.get(k) {
+                    Some((cached_text, _)) => cached_text != *text, // hash collision
+                    None => true,
+                }
+            })
             .map(|(i, _)| i)
             .collect();
 
@@ -98,14 +110,14 @@ impl Embedder {
             let embeddings = self.run_batch(&uncached_texts)?;
 
             for (idx, emb) in uncached.into_iter().zip(embeddings) {
-                self.cache.insert(keys[idx], emb);
+                self.cache.insert(keys[idx], (truncated[idx].to_owned(), emb));
             }
         }
 
         // Collect results in input order from cache
         let results: Vec<Vec<f32>> = keys
             .iter()
-            .map(|k| self.cache[k].clone())
+            .map(|k| self.cache[k].1.clone())
             .collect();
 
         Ok(results)
@@ -130,9 +142,16 @@ impl Embedder {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        let empty_indices: Vec<usize> = encodings
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.get_ids().is_empty())
+            .map(|(i, _)| i)
+            .collect();
         anyhow::ensure!(
-            encodings.iter().all(|e| !e.get_ids().is_empty()),
-            "tokenizer produced empty encoding for one or more texts"
+            empty_indices.is_empty(),
+            "tokenizer produced empty encoding for inputs at indices: {:?}",
+            empty_indices
         );
 
         let batch_size = encodings.len();

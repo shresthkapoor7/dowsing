@@ -26,26 +26,24 @@ const BEAM: usize = 3;
 const MIN_WORDS: usize = 50; // pages with fewer words are stubs/indexes — skip scoring
 
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct PageResult {
     pub url: String,
     pub content: String,
     pub score: f32,
-    pub hop: usize,
 }
 
 pub struct NavResult {
     /// All pages found, sorted by score descending
     pub pages: Vec<PageResult>,
-    /// Total hops taken
+    /// Number of hop iterations attempted (includes the final hop that triggered a stop)
     pub hops: usize,
 }
 
-/// Print only when debug mode is on.
+/// Print only when debug mode is on (to stderr so stdout stays clean).
 macro_rules! dbg_print {
     ($debug:expr, $($arg:tt)*) => {
         if $debug {
-            println!($($arg)*);
+            eprintln!($($arg)*);
         }
     };
 }
@@ -106,7 +104,6 @@ pub async fn navigate(
                 url: current_url.clone(),
                 content: page_content,
                 score: page_score,
-                hop,
             });
 
             if page_score > best_score {
@@ -250,7 +247,6 @@ pub async fn navigate(
                         url: url.clone(),
                         content,
                         score: s,
-                        hop: hop + 1,
                     });
 
                     if s > best_next_score {
