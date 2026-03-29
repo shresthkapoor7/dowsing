@@ -304,6 +304,7 @@ async fn restart_with_debugging(binary: &std::path::Path) -> Result<()> {
         .arg(&name)
         .arg("--args")
         .arg(format!("--remote-debugging-port={}", DEBUG_PORT))
+        .arg("--remote-debugging-address=127.0.0.1")
         .arg("--remote-allow-origins=*")
         .arg("--disable-blink-features=AutomationControlled")
         .arg("--disable-infobars")
@@ -336,6 +337,7 @@ async fn restart_with_debugging(binary: &std::path::Path) -> Result<()> {
     // Relaunch with debug port
     Command::new(binary)
         .arg(format!("--remote-debugging-port={}", DEBUG_PORT))
+        .arg("--remote-debugging-address=127.0.0.1")
         .arg("--remote-allow-origins=*")
         .arg("--disable-blink-features=AutomationControlled")
         .arg("--disable-infobars")
