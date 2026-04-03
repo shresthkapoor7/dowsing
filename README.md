@@ -38,6 +38,57 @@ cargo run -- "how to configure auth in NextAuth v5" "https://authjs.dev"
 cargo run -- "what is ownership in rust" "https://doc.rust-lang.org/book/" --debug
 ```
 
+## Examples
+
+### Documentation sites
+
+```bash
+# Find how to configure middleware in Next.js
+cargo run -- "how to write middleware in Next.js app router" "https://nextjs.org/docs"
+
+# Look up a specific Rust std trait
+cargo run -- "how does the Iterator flat_map method work" "https://doc.rust-lang.org/std/"
+
+# Find Stripe's webhook signature verification docs
+cargo run -- "how to verify webhook signatures" "https://docs.stripe.com"
+```
+
+### PDFs
+
+Dowsing works on any page your browser can load — including PDFs rendered inline by Chrome.
+
+```bash
+# Navigate to a hosted research paper and extract the methodology section
+cargo run -- "what dataset was used for evaluation" "https://arxiv.org/pdf/2401.00001"
+
+# Pull terms from a hosted legal document
+cargo run -- "termination clause and notice period" "https://example.com/contract.pdf"
+```
+
+### LinkedIn
+
+Because dowsing connects to your running browser, it has access to your LinkedIn session. No login, no scraping — just navigate as if you were browsing yourself.
+
+```bash
+# Read someone's experience and skills from their profile
+cargo run -- "current role and past experience" "https://www.linkedin.com/in/someprofile"
+
+# Find job postings matching a role
+cargo run -- "senior rust engineer remote" "https://www.linkedin.com/jobs/"
+```
+
+### Internal / authenticated pages
+
+Any site your browser is already logged into works the same way — Notion, Confluence, GitHub, internal dashboards.
+
+```bash
+# Find a specific page in a Notion workspace
+cargo run -- "Q2 roadmap milestones" "https://www.notion.so/yourworkspace"
+
+# Look up a Confluence page
+cargo run -- "deployment runbook for payments service" "https://yourcompany.atlassian.net/wiki"
+```
+
 ## How it works
 
 ### Overview
