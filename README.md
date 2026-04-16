@@ -1,6 +1,6 @@
 # dowsing
 
-> **Experimental.** Work in progress. Made by Shresth Kapoor.
+> **Experimental.** Work in progress.
 
 Navigate any website to answer a question using embedding similarity. No LLM per navigation step. No API costs during traversal.
 
